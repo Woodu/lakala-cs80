@@ -1,0 +1,15 @@
+[package]
+name = "cs80-panel"
+version = "0.1.0"
+description = "CS80 状态屏桌面壳（Web 画布 + 常驻 host）"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+
+[profile.release]
+strip = true
+lto = true

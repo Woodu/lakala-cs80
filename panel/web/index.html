@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CS80 状态屏</title>
+<link rel="stylesheet" href="vendor/gridstack.min.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <div class="tabbar" id="page-tabs"></div>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark"></span>CS80 状态屏</div>
+    <span class="pill" id="device-pill"><span class="dot"></span><span id="device-text">连接中…</span></span>
+    <span class="pill mono" id="push-pill" title="上一帧推送：耗时 / 变化 tile 数">推送 —</span>
+
+    <div class="spacer"></div>
+
+    <div class="slider" title="屏幕亮度（5–100，步长 5）">
+      <span class="hint">亮度</span>
+      <input type="range" id="brightness" min="5" max="100" step="5" value="100">
+      <span class="val" id="brightness-val">—</span>
+    </div>
+    <select class="input" id="saver-file" title="屏保视频（把视频丢进 ~/Movies/cs80-screensaver 就会出现在这里）"
+            style="width:auto;max-width:150px;height:26px;font-size:11.5px"></select>
+    <button class="btn ghost" id="btn-saver" title="播放/退出屏保">屏保</button>
+    <label class="hint" style="display:flex;align-items:center;gap:4px;margin:0" title="锁屏后自动播放屏保">
+      <input type="checkbox" id="saver-auto" style="accent-color:hsl(43 50% 70%);width:12px;height:12px;margin:0">锁屏播放
+    </label>
+    <button class="btn ghost" id="btn-pause" title="暂停推帧：屏上定格（USB 保活不停），用来判断闪烁是屏幕自身还是我们推的">暂停推送</button>
+    <button class="btn ghost" id="btn-sleep" title="关闭背光（点唤醒恢复）">待机</button>
+    <button class="btn ghost" id="btn-wake">唤醒</button>
+  </header>
+
+  <aside class="sidebar">
+    <div class="section-label">组件库</div>
+    <div class="palette" id="palette"></div>
+
+    <div class="section-label">布局</div>
+    <div class="row wrap">
+      <button class="btn btn-sm" id="btn-export">导出 JSON</button>
+      <button class="btn btn-sm" id="btn-import">导入</button>
+      <input type="file" id="file-import" accept="application/json" hidden>
+    </div>
+    <div class="row wrap" style="margin-top:6px">
+      <button class="btn btn-sm" id="btn-default">恢复默认</button>
+      <button class="btn btn-sm" id="btn-delpage">删除画布</button>
+    </div>
+    <div class="hint" style="margin-top:10px">
+      点组件库添加；拖动组件移动，拖四角/四边缩放。<br>
+      <kbd>←↑→↓</kbd> 微调 <kbd>⌘D</kbd> 复制 <kbd>⌫</kbd> 删除
+    </div>
+  </aside>
+
+  <section class="stage">
+    <div class="board" id="board">
+      <div class="grid-stack" id="grid"></div>
+    </div>
+    <div class="board" id="custom-holder" hidden>
+      <canvas id="custom-canvas" width="800" height="1280"></canvas>
+    </div>
+  </section>
+
+  <aside class="inspector">
+    <div class="section-label">属性</div>
+    <div id="inspector-body"></div>
+
+    <div class="card-panel" style="margin-top:14px">
+      <h3>设备</h3>
+      <div class="hint" id="device-detail">—</div>
+    </div>
+
+    <div class="section-label">画布</div>
+    <div class="row">
+      <button class="btn btn-sm icon" id="zoom-out">−</button>
+      <span class="pill mono"><span id="zoom-val">52%</span></span>
+      <button class="btn btn-sm icon" id="zoom-in">+</button>
+      <button class="btn btn-sm" id="btn-full">整帧重推</button>
+    </div>
+  </aside>
+</div>
+
+<div class="toasts"></div>
+
+<script>
+// 前端错误回传：WKWebView 里看不到 devtools，出问题直接写到 host 的 /tmp/cs80_web.log
+(function () {
+  const send = (kind, msg) => navigator.sendBeacon
+    ? navigator.sendBeacon('/api/debug', `[${kind}] ${msg}`)
+    : fetch('/api/debug', { method: 'POST', body: `[${kind}] ${msg}` }).catch(() => {});
+  addEventListener('error', (e) => send('error', (e.message || e.error) + ' @ ' + (e.filename || '') + ':' + (e.lineno || '')));
+  addEventListener('unhandledrejection', (e) => send('reject', String(e.reason && (e.reason.stack || e.reason))));
+  addEventListener('load', () => send('boot', 'loaded ' + navigator.userAgent.slice(0, 80)));
+  setTimeout(() => {
+    if (!window.__cs80) send('stall', '10s 后 __cs80 仍未就绪; GridStack=' + typeof window.GridStack);
+  }, 10000);
+})();
+</script>
+<script src="vendor/gridstack-all.js"></script>
+<script type="module" src="main.js"></script>
+</body>
+</html>

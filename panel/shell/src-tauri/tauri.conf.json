@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CS80 Panel",
+  "version": "0.1.0",
+  "identifier": "com.xbsheng.cs80panel",
+  "build": {
+    "frontendDist": "../../web"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "CS80 状态屏",
+        "width": 1180,
+        "height": 1000,
+        "minWidth": 900,
+        "minHeight": 700,
+        "url": "http://127.0.0.1:8787/",
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ],
+    "shortDescription": "CS80 状态屏控制器",
+    "longDescription": "把拉卡拉 CS80 客显屏当 Agent 状态副屏：画布编辑器 + 常驻推帧。",
+    "resources": {
+      "../../host.py": "panel/host.py",
+      "../../qdc1": "panel/qdc1",
+      "../../README.md": "panel/README.md",
+      "../../web/index.html": "panel/web/index.html",
+      "../../web/main.js": "panel/web/main.js",
+      "../../web/core.js": "panel/web/core.js",
+      "../../web/widgets.js": "panel/web/widgets.js",
+      "../../web/editor.js": "panel/web/editor.js",
+      "../../web/pusher.js": "panel/web/pusher.js",
+      "../../web/styles.css": "panel/web/styles.css",
+      "../../web/vendor/gridstack-all.js": "panel/web/vendor/gridstack-all.js",
+      "../../web/vendor/gridstack.min.css": "panel/web/vendor/gridstack.min.css",
+      "../../web/pages/stock.js": "panel/web/pages/stock.js",
+      "../../web/logos/pi.svg": "panel/web/logos/pi.svg",
+      "../../web/logos/claude.svg": "panel/web/logos/claude.svg",
+      "../../web/logos/openai.svg": "panel/web/logos/openai.svg",
+      "../../web/logos/deepseek.svg": "panel/web/logos/deepseek.svg",
+      "../../web/assets/runcat/cat_running_0.png": "panel/web/assets/runcat/cat_running_0.png",
+      "../../web/assets/runcat/cat_running_1.png": "panel/web/assets/runcat/cat_running_1.png",
+      "../../web/assets/runcat/cat_running_2.png": "panel/web/assets/runcat/cat_running_2.png",
+      "../../web/assets/runcat/cat_running_3.png": "panel/web/assets/runcat/cat_running_3.png",
+      "../../web/assets/runcat/cat_running_4.png": "panel/web/assets/runcat/cat_running_4.png",
+      "../../web/lunar.js": "panel/web/lunar.js",
+      "../../web/media/wallpaper.mp4": "panel/web/media/wallpaper.mp4",
+      "../../web/vendor/gridstack.LICENSE": "panel/web/vendor/gridstack.LICENSE"
+    }
+  }
+}
