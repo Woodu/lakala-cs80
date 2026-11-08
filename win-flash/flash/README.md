@@ -1,5 +1,7 @@
 # win-flash/flash —— 刷机与恢复工具
 
+> 概览与验收标准看 [`../../docs/firmware.md`](../../docs/firmware.md)；本文件是命令级细节。
+
 两个入口，都靠纯 Python 走 USB（无需厂商工具）：
 
 | 脚本 | 作用 |
@@ -8,6 +10,10 @@
 | **`flash_at.py`** | 按 `fw.pac` **整包刷 QuecPython**（含格式化文件系统 + 重建 NV）。用于「恢复成 Python 环境」 |
 
 ---
+
+> 依赖说明：脚本全部走**串口**（`pyserial`）跑 PDL/FDL 协议，**不需要 pyusb / libusb / Zadig**。
+> `third_party/sprdflash/usb_transport.py` 是另一条 libusb 路径（`transport='usb'`），本项目没有用到，
+> 留着只是因为它是上游 sprdflash 的一部分。
 
 ## 0. 一次性准备
 

@@ -56,13 +56,17 @@ out.jpg
 *.key
 
 # QDisplay 上位机的自定义源放在 build/ 里，别被上面的 build/ 规则吃掉
-!win-display/qdisplay/build/
-!win-display/qdisplay/build/**
 
 # 部署时备份的原始 DLL
 *.orig
 
 # 摄像头截图/状态文件的本地输出
-cam_*.jpg
-qdgui*.png
 
+__pycache__/
+panel/qdc1
+panel/shell/node_modules/
+panel/shell/src-tauri/target/
+panel/shell/src-tauri/gen/
+
+# Tauri 生成的 schema / 构建产物
+panel/shell/src-tauri/gen/
