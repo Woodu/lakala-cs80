@@ -66,5 +66,3 @@ out.jpg
 cam_*.jpg
 qdgui*.png
 
-# 移远 USB 驱动（41 MB，厂商版权，请自行从移远官网获取）
-win-flash/flash/quectel-usb-driver.zip
