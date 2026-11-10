@@ -50,16 +50,19 @@ GRID_PAGE = {
     "name": "主页",
     "type": "grid",
     "widgets": [
-        # 左上：3×2 时钟（右上角待带天气，城市 北京）
+        # 左上：3×2 表盘时钟（右上角带天气，城市 北京）
         {"id": "clock", "type": "clock_dial", "cell": [0, 0, 3, 2],
          "config": {"city": "北京", "showWeather": True}},
-        # 右上：2×2 RunCat
+        # 右上：2×2 RunCat（CPU/MEM 环 + 奔跑猫，右上角显示本机局域网 IP）
         {"id": "runcat", "type": "runcat", "cell": [3, 0, 2, 2], "config": {}},
-        # 中间两行：5×2 自选股（新版多股组件，一行一只）
+        # 中间：5×2 自选股（一格一只，只在 A 股交易时段轮询）
         {"id": "stock", "type": "stock", "cell": [0, 2, 5, 2],
-         "config": {"symbols": "sz002654,sh600641", "title": "自选股"}},
-        # 剩下的 5×4 给 Agent
-        {"id": "agent", "type": "agent", "cell": [0, 4, 5, 4], "config": {}},
+         "config": {"symbols": "sh000001,sz399001"}},
+        # 5×2 热榜：勾选的数据源作为 Tab，按 60 秒轮播
+        {"id": "news", "type": "news", "cell": [0, 4, 5, 2],
+         "config": {"sources": ["toutiao", "baidu", "weibo"], "rotate": 60}},
+        # 底部：5×2 Agent 会话列表（自动扫描本机 Pi / Claude Code / Codex / DeepSeek）
+        {"id": "agent", "type": "agent", "cell": [0, 6, 5, 2], "config": {}},
     ],
 }
 
