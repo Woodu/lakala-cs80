@@ -77,13 +77,9 @@
         <button class="btn btn-sm" data-color="blue">蓝</button>
         <button class="btn btn-sm" data-color="black">黑</button>
       </div>
-      <div class="row wrap" style="margin-top:8px" id="audio-row"
-           title="喇叭：MP3 最大 4 MiB，先上传到设备 UFS 再播放（固件 0.3.0 已带音频通路）">
+      <div class="row wrap" style="margin-top:8px">
         <span class="hint" style="width:100%">喇叭</span>
-        <button class="btn btn-sm" id="btn-audio-pick">选择 MP3 并播放</button>
-        <button class="btn btn-sm" id="btn-audio-stop">停止</button>
-        <input type="file" id="audio-file" accept="audio/mpeg,.mp3" hidden>
-        <span class="hint" id="audio-state" style="width:100%">—</span>
+        <button class="btn btn-sm" id="btn-audio-open">音频播放…</button>
       </div>
     </div>
 
@@ -95,6 +91,32 @@
       <button class="btn btn-sm" id="btn-full">整帧重推</button>
     </div>
   </aside>
+</div>
+
+<div class="modal" id="audio-modal" hidden>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h3>音频播放</h3>
+      <button class="btn btn-sm icon" id="audio-close" title="关闭">×</button>
+    </div>
+    <p class="hint" style="margin:0 0 10px">
+      设备固件只解码 MP3：其它格式（WAV / FLAC / M4A / OGG / AAC / WMA / 视频音轨…）
+      会在这台电脑上用 ffmpeg 转成 128 kbps MP3 再上传，转换后需 ≤ 4 MiB。
+    </p>
+    <div class="row wrap">
+      <button class="btn" id="btn-audio-pick">选择文件并播放</button>
+      <button class="btn btn-sm" id="btn-audio-stop">停止</button>
+      <input type="file" id="audio-file"
+             accept="audio/*,video/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus,.wma,.aiff,.amr,.mp4,.mov,.mkv,.webm"
+             hidden>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <span class="hint" style="width:56px">音量</span>
+      <input type="range" id="audio-volume" min="0" max="100" step="5" value="70" style="flex:1">
+      <span class="pill mono"><span id="audio-volume-val">70</span></span>
+    </div>
+    <div class="hint" id="audio-state" style="margin-top:10px">—</div>
+  </div>
 </div>
 
 <div class="toasts"></div>

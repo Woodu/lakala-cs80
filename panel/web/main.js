@@ -157,38 +157,76 @@ async function boot() {
   };
   el('#btn-sleep').onclick = () => postJson('/api/control', { cmd: 'sleep' }).then(() => toast('已待机'));
   el('#btn-wake').onclick = () => postJson('/api/control', { cmd: 'wake' }).then(() => toast('已唤醒'));
-  // 喇叭：选一个本地 MP3 → 原样 POST 给 host（它再分块传给设备）→ 上传完自动播放
+  // 音频播放：独立弹窗（非 MP3 在 host 侧用 ffmpeg 转成 128k MP3 再上传给设备）
+  const audioModal = el('#audio-modal');
+  el('#btn-audio-open').onclick = () => {
+    audioModal.hidden = false;
+    refreshAudio();
+  };
+  el('#audio-close').onclick = () => { audioModal.hidden = true; };
+  audioModal.addEventListener('click', (ev) => {
+    if (ev.target === audioModal) audioModal.hidden = true;
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') audioModal.hidden = true;
+  });
+  async function refreshAudio() {
+    try {
+      const j = await postJson('/api/audio', { action: 'query' });
+      const au = j.audio || {};
+      el('#audio-state').textContent = au.ok
+        ? `设备音量 ${au.receive ?? '—'} · ${au.decode ? '播放中' : '空闲'}`
+        : `查询失败：${au.err || '未连接设备'}`;
+      if (typeof au.receive === 'number' && au.receive >= 0) {
+        el('#audio-volume').value = au.receive;
+        el('#audio-volume-val').textContent = au.receive;
+      }
+    } catch (e) {
+      el('#audio-state').textContent = '查询失败：' + e.message;
+    }
+  }
   el('#btn-audio-pick').onclick = () => el('#audio-file').click();
   el('#audio-file').addEventListener('change', async (ev) => {
     const f = ev.target.files[0];
     ev.target.value = '';
     if (!f) return;
-    if (f.size > 4 * 1024 * 1024) return toast('MP3 最大 4 MiB', 'warn');
-    el('#audio-state').textContent = `上传中… ${(f.size / 1024).toFixed(0)} KB`;
+    const state = el('#audio-state');
+    state.textContent = `上传中… ${f.name}（${(f.size / 1024).toFixed(0)} KB）`;
     try {
-      const res = await fetch('/api/audio/file?play=1', {
+      const res = await fetch('/api/audio/file?play=1&name=' + encodeURIComponent(f.name), {
         method: 'POST',
-        headers: { 'Content-Type': 'audio/mpeg' },
+        headers: { 'Content-Type': 'application/octet-stream' },
         body: f,
       });
       const j = await res.json();
-      if (!j.ok) throw new Error((j.play && j.play.err) || (j.upload && j.upload.err) || '播放失败');
-      el('#audio-state').textContent = `播放中 · ${(f.size / 1024).toFixed(0)} KB`;
-      toast('喇叭开始播放');
+      if (!j.ok) throw new Error(j.error || (j.play && j.play.err) || (j.upload && j.upload.err) || '播放失败');
+      const c = j.upload && j.upload.convert;
+      const conv = c && c.converted ? `${c.format} → mp3 · ${c.ms}ms` : 'mp3 直传';
+      state.textContent = `播放中 · ${f.name} · ${conv}`;
     } catch (e) {
-      el('#audio-state').textContent = '失败';
-      toast('喇叭：' + e.message, 'warn');
+      state.textContent = '失败：' + e.message;
+      toast('音频：' + e.message, 'warn');
     }
   });
   el('#btn-audio-stop').onclick = async () => {
     try {
       const j = await postJson('/api/audio', { action: 'stop' });
       el('#audio-state').textContent = j.ok ? '已停止' : '停止失败';
-      toast(j.ok ? '喇叭已停止' : '喇叭停止失败', j.ok ? 'info' : 'warn');
     } catch (e) {
-      toast('喇叭：' + e.message, 'warn');
+      el('#audio-state').textContent = '停止失败：' + e.message;
     }
   };
+  const vol = el('#audio-volume');
+  vol.addEventListener('input', () => (el('#audio-volume-val').textContent = vol.value));
+  vol.addEventListener('change', async () => {
+    try {
+      await postJson('/api/audio', { action: 'volume', value: Number(vol.value) });
+      el('#audio-state').textContent = `设备音量 ${vol.value}`;
+    } catch (e) {
+      el('#audio-state').textContent = '设置音量失败：' + e.message;
+    }
+  });
+
   el('#btn-full').onclick = () => {
     pusher.markFull();
     toast('整帧重推');

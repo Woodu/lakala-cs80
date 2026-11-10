@@ -359,3 +359,22 @@ kbd {
   font-family: var(--mono); font-size: 10.5px; padding: 1px 5px;
   border: 1px solid var(--line-2); border-radius: 4px; background: var(--bg-3); color: var(--fg-3);
 }
+
+/* 音频控制弹窗 */
+.modal {
+  position: fixed; inset: 0; z-index: 50;
+  display: grid; place-items: center;
+  background: rgb(0 0 0 / 55%);
+  backdrop-filter: blur(2px);
+}
+.modal[hidden] { display: none; }
+.modal-panel {
+  width: min(460px, calc(100vw - 40px));
+  padding: 18px;
+  background: hsl(var(--bgh) var(--bgs) calc(var(--bgl) + 4%));
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgb(0 0 0 / 55%);
+}
+.modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.modal-head h3 { margin: 0; font-size: 14px; font-weight: 600; color: var(--fg); }
