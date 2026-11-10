@@ -482,6 +482,8 @@ def _check_qdc1(com):
 # 固件 QDC1 type 7 的子命令（flags）
 AUDIO_QUERY, AUDIO_STOP, AUDIO_VOLUME, AUDIO_BEGIN, AUDIO_END, AUDIO_PLAY, AUDIO_VERIFY = range(7)
 AUDIO_CHUNK = 16384          # type 8/9 单块上限（固件约定 1..16384）
+# 固件只认 MP3，所以别的格式先在主机上用 ffmpeg 转成 128 kbps MP3 再上传
+AUDIO_IN_MAX = 64 * 1024 * 1024   # 上传原始文件上限
 AUDIO_MAX = 4 * 1024 * 1024  # demo 固件的上传上限
 
 
@@ -819,6 +821,20 @@ class Device:
             return {"ok": False, "err": "hash-mismatch", "expect": h, "got": got}
         return {"ok": True, "size": len(data), "hash": h}
 
+    def play_uploaded(self, retry=True):
+        """播放设备上已有的文件。PLAY 回 status=4（BAD_STATE）时多半是音频路由被复位了：
+        读诊断（sub 8）→ 不是 speaker 就改回来（sub 9=0）→ 音量为 0 就设 70 → 重试一次。"""
+        r = self.audio(AUDIO_PLAY, timeout=20)
+        if r.get("ok") or not retry or r.get("status") != 4:
+            return r
+        d = self.audio(8)  # 诊断：rx=路由
+        if d.get("ok") and d.get("rx") not in (None, 0):
+            self.audio(9, offset=0)
+        q = self.audio(AUDIO_QUERY)
+        if q.get("ok") and not q.get("rx"):
+            self.audio(AUDIO_VOLUME, offset=70)
+        return self.audio(AUDIO_PLAY, timeout=20)
+
     def upload_mp3(self, data):
         if not data:
             return {"ok": False, "err": "empty"}
@@ -850,21 +866,69 @@ class Device:
                 r = self._upload_locked(data, h)
                 if not r.get("ok"):
                     return r
-            r = self.audio(AUDIO_PLAY, timeout=20)
+            r = self.play_uploaded()
             return dict(r, size=len(data), hash=h)
+
+
+_FFMPEG = {"path": None}
+
+
+def ffmpeg_path():
+    """找 ffmpeg：包装版 App 从 Finder 启动时 PATH 只有 /usr/bin:/bin，which 找不到 Homebrew 的。"""
+    if _FFMPEG["path"] is not None:
+        return _FFMPEG["path"]
+    cand = [os.environ.get("CS80_FFMPEG"), shutil.which("ffmpeg")]
+    cand += ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg",
+             os.path.join(HERE, "ffmpeg.exe"), os.path.join(HERE, "ffmpeg")]
+    found = next((c for c in cand if c and os.path.isfile(c) and os.access(c, os.X_OK)), "")
+    _FFMPEG["path"] = found
+    return found
+
+
+def audio_to_mp3(data, name=""):
+    """任意音视频 → 128 kbps / 44.1 kHz / 双声道 MP3（已经是 MP3 就原样返回）。
+
+    返回 (mp3_bytes, info)。固件只解码 MP3，WAV/FLAC/M4A… 都在主机侧转好再上传。
+    """
+    ext = os.path.splitext(str(name or ""))[1].lower()
+    is_mp3 = ext == ".mp3" or data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0)
+    if is_mp3:
+        return data, {"converted": False, "format": (ext[1:] or "mp3")}
+    ff = ffmpeg_path()
+    if not ff:
+        raise RuntimeError("非 MP3 需要 ffmpeg 转换（macOS: brew install ffmpeg）")
+    tmp = tempfile.mkdtemp(prefix="cs80-audio-")
+    src = os.path.join(tmp, "in" + (ext or ".bin"))
+    dst = os.path.join(tmp, "out.mp3")
+    try:
+        with open(src, "wb") as f:
+            f.write(data)
+        t0 = time.time()
+        r = subprocess.run([ff, "-y", "-v", "error", "-i", src, "-vn",
+                            "-ac", "2", "-ar", "44100", "-b:a", "128k", dst],
+                           capture_output=True, timeout=180)
+        if r.returncode != 0 or not os.path.exists(dst):
+            raise RuntimeError(((r.stderr or b"").decode("utf-8", "replace").strip().splitlines() or ["ffmpeg 转换失败"])[-1][:160])
+        with open(dst, "rb") as f:
+            out = f.read()
+        return out, {"converted": True, "format": (ext[1:] or "?"), "ms": int((time.time() - t0) * 1000),
+                     "inBytes": len(data), "outBytes": len(out)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def tts_mp3(text):
     """macOS：用 say 生成语音，再让 ffmpeg 转成设备能解的 MP3。"""
     if sys.platform != "darwin":
         raise RuntimeError("say 播报只在 macOS 可用；其它平台请直接上传 MP3")
-    if not shutil.which("ffmpeg"):
+    ff = ffmpeg_path()
+    if not ff:
         raise RuntimeError("需要 ffmpeg 才能把语音转成 MP3（brew install ffmpeg）")
     with tempfile.TemporaryDirectory() as d:
         aiff, mp3 = os.path.join(d, "say.aiff"), os.path.join(d, "say.mp3")
         subprocess.run(["say", "-o", aiff, text], check=True, timeout=60)
         subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", aiff, "-codec:a", "libmp3lame", "-q:a", "5", mp3],
+            [ff, "-y", "-loglevel", "error", "-i", aiff, "-codec:a", "libmp3lame", "-q:a", "5", mp3],
             check=True, timeout=120,
         )
         with open(mp3, "rb") as f:
@@ -965,8 +1029,17 @@ def _opt(mod):
         return None
 
 
+FOREIGN = re.compile(r"^\d+\.[A-Za-z0-9$]+$")  # 东财带市场号的代码：100.SPX / 103.ES00Y
+
+
+def _is_foreign(symbol):
+    return bool(FOREIGN.match(str(symbol).strip()))
+
+
 def _secid(symbol):
-    """sh000001 -> 1.000001（东财 secid 格式）"""
+    """sh000001 -> 1.000001；100.SPX / 103.ES00Y 原样透传（东财 secid 格式）"""
+    if _is_foreign(symbol):
+        return str(symbol).strip()
     t = str(symbol).lower().replace(".", "")
     if t.startswith("sh"):
         return "1." + t[2:]
@@ -1010,12 +1083,11 @@ def _sina_quote(symbol):
 
 
 def _em_quote(symbol):
-    """东财实时快照，顺带拿到 五档 之外的字段（备用）"""
+    """东财快照（A 股走 push2，外盘/期货走 push2delay，后者没有 302 拦截）"""
     fields = "f43,f44,f45,f46,f57,f58,f60,f169,f170"
-    url = "https://push2.eastmoney.com/api/qt/stock/get?secid=%s&ut=fa5fd1943c7b386f172d6893dbfba10b&fields=%s" % (
-        _secid(symbol),
-        fields,
-    )
+    host = "push2delay" if _is_foreign(symbol) else "push2"
+    url = "https://%s.eastmoney.com/api/qt/stock/get?invt=2&secid=%s" \
+          "&ut=fa5fd1943c7b386f172d6893dbfba10b&fields=%s" % (host, _secid(symbol), fields)
     d = http_json(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
     data = d.get("data") or {}
     if not data:
@@ -1034,7 +1106,9 @@ def _em_quote(symbol):
 
 
 def stock(symbol):
-    """现价快照：efinance → akshare → 新浪 → 东财"""
+    """现价快照：A 股 efinance → akshare → 新浪 → 东财；外盘（100.SPX / 103.ES00Y）直接东财"""
+    if _is_foreign(symbol):
+        return _em_quote(symbol)
     ef = _opt("efinance")
     if ef is not None:
         try:
@@ -1076,7 +1150,7 @@ def stock(symbol):
 
 def kline(symbol, limit=60):
     """日 K：efinance → akshare → 东财"""
-    ef = _opt("efinance")
+    ef = None if _is_foreign(symbol) else _opt("efinance")
     if ef is not None:
         try:
             df = ef.stock.get_quote_history(_plain(symbol), klt=101)
@@ -1130,8 +1204,8 @@ def _kline_payload(symbol, name, candles, source):
 
 
 def minute(symbol):
-    """分时（当日 1 分钟）：efinance → akshare → 东财 trends2"""
-    ef = _opt("efinance")
+    """分时（当日 1 分钟）：A 股 efinance → akshare → 东财 trends2；外盘直接东财"""
+    ef = None if _is_foreign(symbol) else _opt("efinance")
     if ef is not None:
         try:
             df = ef.stock.get_quote_history(_plain(symbol), klt=1)
@@ -1139,7 +1213,7 @@ def minute(symbol):
             return {"symbol": symbol, "preClose": float(df.iloc[0]["开盘"]), "points": points, "source": "efinance"}
         except Exception:
             pass
-    ak = _opt("akshare")
+    ak = None if _is_foreign(symbol) else _opt("akshare")
     if ak is not None:
         try:
             df = ak.stock_zh_a_hist_min_em(symbol=_plain(symbol), period="1")
@@ -2177,15 +2251,24 @@ class Handler(BaseHTTPRequestHandler):
                 f.write(time.strftime("%H:%M:%S ") + text + "\n")
             return self._send(200, {"ok": True})
         if url.path == "/api/audio/file":
-            # 浏览器直接 POST 原始 MP3 字节；?play=1 时传完就播
+            # 浏览器 POST 原始文件字节；?name=foo.wav 给扩展名，?play=1 传完就播。
+            # 非 MP3 先转码（固件只认 MP3）。
             data = self.rfile.read(n)
             if not data:
                 return self._send(400, {"error": "empty body"})
+            if len(data) > AUDIO_IN_MAX:
+                return self._send(413, {"error": "文件太大（上限 64 MiB）"})
+            name = (urllib.parse.parse_qs(url.query).get("name") or [""])[0]
+            try:
+                data, info = audio_to_mp3(data, name)
+            except Exception as exc:
+                return self._send(400, {"error": str(exc)})
             if len(data) > AUDIO_MAX:
-                return self._send(413, {"error": "MP3 最大 4 MiB"})
-            r = self.device.upload_mp3(data)
+                return self._send(413, {"error": "转换后 %.1f MiB，超过固件 4 MiB 上限"
+                                        % (len(data) / 1048576.0), "convert": info})
+            r = dict(self.device.upload_mp3(data), convert=info)
             if r.get("ok") and "play" in urllib.parse.parse_qs(url.query):
-                p = self.device.audio(AUDIO_PLAY, timeout=20)
+                p = self.device.play_uploaded()
                 return self._send(200 if p.get("ok") else 500, {"ok": bool(p.get("ok")), "upload": r, "play": p})
             return self._send(200 if r.get("ok") else 500, {"ok": bool(r.get("ok")), "upload": r})
         if url.path == "/api/audio":
@@ -2199,9 +2282,15 @@ class Handler(BaseHTTPRequestHandler):
                 v = max(0, min(100, int(body.get("value") or 0)))
                 ev = self.device.audio(AUDIO_VOLUME, offset=v)
             elif action == "play":
-                ev = self.device.play_file(body["file"]) if body.get("file") else self.device.audio(AUDIO_PLAY, timeout=20)
+                ev = self.device.play_file(body["file"]) if body.get("file") else self.device.play_uploaded()
             elif action == "verify":
                 ev = self.device.audio(AUDIO_VERIFY)
+            elif action == "diag":
+                # 固件诊断：路由/档位/PA/增益（sub 8，只读）
+                ev = self.device.audio(8)
+            elif action == "route":
+                # 停止后改音频路由：0=speaker（正常），1/2 诊断用
+                ev = self.device.audio(9, offset=max(0, min(2, int(body.get("value") or 0))))
             elif action == "upload":
                 if not body.get("file"):
                     return self._send(400, {"error": "upload 需要 file 路径；浏览器请用 POST /api/audio/file"})

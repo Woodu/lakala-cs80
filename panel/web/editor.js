@@ -15,7 +15,11 @@ const FIELDS = {
   clock: [['city', '天气城市'], ['font', '数字字体', ['mono', 'sans', 'lcd']]],
   clock_dial: [['city', '天气城市']],
   weather: [['city', '城市（中文）']],
-  stock: [['symbols', '股票代码（逗号分隔，一行一只）']],
+  stock: [
+    ['symbols', 'A 股盘中（代码，逗号分隔）'],
+    ['us', '美股盘中（如 100.SPX,100.NDX）'],
+    ['usFut', '其余时间/期货（如 103.ES00Y,103.NQ00Y）'],
+  ],
   kline: [['symbol', '代码（sh000001）']],
   crypto: [['ids', 'coingecko id（逗号分隔）']],
   github: [['repo', 'owner/repo']],

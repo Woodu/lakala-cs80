@@ -205,7 +205,40 @@ function rowsFor(innerH, baseRowH, count) {
   return { rows, rowH: Math.min(baseRowH, innerH / rows) };
 }
 
-/** A 股交易时段（周一–周五 9:30–11:30 / 13:00–15:00）；休盘就不必再轮询 */
+/** 某时区的「周几 + 当天第几分钟」 */
+function tzClock(tz) {
+  const p = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit',
+  }).formatToParts(new Date());
+  const get = (t) => (p.find((x) => x.type === t) || {}).value || '';
+  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(get('weekday'));
+  return { day, minutes: (Number(get('hour')) % 24) * 60 + Number(get('minute')) };
+}
+
+const inWindow = (m, a, b) => m >= a && m <= b;
+
+/**
+ * 现在该看哪一组行情：
+ *   A 股盘中（北京 9:30–15:00，周一–五）→ 自选股
+ *   美股盘中（纽约 9:30–16:00，周一–五）→ 美股指数
+ *   其余时间（含美股盘前、A 股收盘后）→ 美股期货
+ */
+export function stockSession() {
+  const cn = tzClock('Asia/Shanghai');
+  if (cn.day >= 1 && cn.day <= 5 && inWindow(cn.minutes, 570, 900)) return { id: 'cn', label: '自选股' };
+  const us = tzClock('America/New_York');
+  if (us.day >= 1 && us.day <= 5 && inWindow(us.minutes, 570, 960)) return { id: 'us', label: '美股指数' };
+  return { id: 'fut', label: '美股期货' };
+}
+
+/** 当前这组代码：没配 us / usFut 就回落到 symbols（保持老配置也能用） */
+export function stockSymbols(cfg = {}) {
+  const id = stockSession().id;
+  const pick = id === 'cn' ? cfg.symbols : id === 'us' ? cfg.us : cfg.usFut;
+  return String(pick || cfg.symbols || 'sh000001').trim();
+}
+
+/** A 股交易时段（周一–周五 9:30–11:30 / 13:00–15:00）；休盘就不必再轮询（K 线用） */
 export function tradingHours() {
   const d = new Date();
   const day = d.getDay();
@@ -995,13 +1028,23 @@ export const WIDGETS = {
     label: '股票',
     icon: '<path d="M2.5 11.5l3.5-3.5 2.5 2 4-4.5"/><path d="M10 5.5h3v3"/>',
     min: [2, 1],
-    config: { symbols: 'sh000001' },
-    needs: { kind: 'portfolio', ttl: 15000, when: tradingHours, query: (cfg) => ({ symbols: cfg.symbols || cfg.symbol || 'sh000001' }) },
+    config: {
+      symbols: 'sh000001',              // A 股盘中
+      us: '100.SPX,100.NDX',            // 美股盘中（标普500 / 纳斯达克100）
+      usFut: '103.ES00Y,103.NQ00Y',     // 其余时间看这两个期货连续合约
+    },
+    needs: {
+      kind: 'portfolio',
+      // 期货时段价格动得慢，60 秒足够；A 股/美股盘中 15 秒
+      ttl: () => (stockSession().id === 'fut' ? 60000 : 15000),
+      query: (cfg) => ({ symbols: stockSymbols(cfg) }),
+    },
     draw(ctx, r, cfg, d, t) {
       const pad = Math.max(8, r.w * 0.025);
       const stamp = freshStamp(d);
+      const session = stockSession();
       const inner = card(ctx, r, t, {
-        title: cfg.title || '股票',
+        title: cfg.title || (cfg.us || cfg.usFut ? session.label : '股票'),
         meta: stamp ? stamp.text : '',
         metaColor: stamp ? stamp.color : '',
         pad,
