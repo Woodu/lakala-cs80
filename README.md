@@ -23,6 +23,7 @@
 | Agent 状态 | 自动扫描本机 Pi / Claude Code / Codex / DeepSeek Harness 的会话，列表按「运行中 → 等待 → 结束」排序，可逐条隐藏 |
 | 屏保 | 选视频（内置 `wallpaper.mp4`，也可用 `panel/add-screensaver.sh` 转自己的），手动播或锁屏自动播 |
 | 控屏 | 亮度（5–100）、待机/唤醒、设备状态回读 |
+| 喇叭 | 上传 MP3（≤4 MiB）并播放、音量、停止；固件自带音频通路，PA 自动开关 |
 | 自检 | 每帧用 `VERIFY` 回读设备 framebuffer 哈希，patch 链哈希必须对上才算成功 |
 
 ## 买第二台设备怎么接（10 步）

@@ -12,8 +12,16 @@
  *   0x03 + u8 cmd + u8 arg                              → 控屏
  *   0x04 + 800*1280*2 B BGR565                          → 屏保：跳过 RGB 转换直接整帧
  *        cmd: 1=设亮度(arg=5..100,步长5) 2=待机 3=唤醒 4=查询状态 5=握手
+ *   0x05 + u8 sub + u8[3] + u32 len + u32 offset + u32 raw + payload → 音频控制（QDC1 type 7）
+ *        sub: 0=查询 1=停止 2=音量(offset) 3=开始上传(offset=总字节,raw=XXH32)
+ *             4=结束上传 5=播放 6=读回校验 7=开始 PCM 8=诊断 9=路由
+ *   0x06 + u32 offset + u32 len + payload               → MP3 上传块（type 8，len≤16384）
+ *   0x07 + u32 len + payload                            → 实时 PCM（type 9，len≤16384）
  * stdout：每条命令一行 JSON（供上层做状态面板）
  * stderr：人类可读日志
+ *
+ * 命令行：--com COMx（Windows 指定口）/ --probe（扫所有 COM 找 QDC1）
+ *         / --hello COMx（只验一个口，host 用来排除过期的注册表映射）
  */
 #include <signal.h>
 #include <stdarg.h>
@@ -66,7 +74,20 @@ static double wall_ms(void) { struct timeval t; gettimeofday(&t, 0); return t.tv
 #define MAX_TILES ((BLOCK_BYTES - 8u) / (TILE_BYTES + 8u))
 #define MAGIC 0x31434451u
 #define ACK_TRIES 5 /* 5 × 400ms 收不到任何 ACK → 判定 USB 链路已死 */
-enum { QD_HELLO = 1, QD_BEGIN = 2, QD_DATA = 3, QD_COMMIT = 4, QD_VERIFY = 6, QD_PATCH = 10, QD_ACK = 128 };
+/* 音频分块上限与固件一致：type 8/9 单块 1..16384 字节 */
+#define AUDIO_CHUNK 16384u
+enum {
+  QD_HELLO = 1,
+  QD_BEGIN = 2,
+  QD_DATA = 3,
+  QD_COMMIT = 4,
+  QD_VERIFY = 6,
+  QD_AUDIO = 7,
+  QD_AUDIO_DATA = 8,
+  QD_PCM = 9,
+  QD_PATCH = 10,
+  QD_ACK = 128
+};
 enum { CTL_BRIGHTNESS = 1, CTL_SLEEP = 2, CTL_WAKE = 3, CTL_STATE = 4, CTL_HELLO = 5 };
 
 static volatile sig_atomic_t stop;
@@ -486,6 +507,60 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   return 0;
 }
 
+/* ---------- 音频：固件 type 7（控制）/ 8（MP3 分块）/ 9（实时 PCM）----------
+ *
+ * 固件 0.3.0 的 features=0x23f 已经包含 bit2（文件音频）和 bit3（PCM），PA 使能
+ * （QL GPIO22）由固件渲染任务管理，主机侧只需要把 MP3 传进去再触发播放。
+ * ACK 的 6 个 u32 在音频命令里被复用为状态字段，这里原样透传给上层。
+ */
+static uint32_t audio_n;
+
+static void audio_reply(uint8_t sub, const char *err, double t0) {
+  if (err)
+    json("{\"event\":\"audio\",\"n\":%u,\"sub\":%u,\"ok\":0,\"err\":\"%s\"}", ++audio_n, sub, err);
+  else
+    json("{\"event\":\"audio\",\"n\":%u,\"sub\":%u,\"ok\":%d,\"status\":%u,\"rx\":%u,\"dec\":%u,"
+         "\"draw\":%u,\"detail\":%u,\"ms\":%u}",
+         ++audio_n, sub, reply_body[0] == 0, reply_body[0], reply_body[1], reply_body[2], reply_body[3],
+         reply_body[5], (uint32_t)(now_ms() - t0));
+}
+
+static int audio_cmd(link_t *l, uint8_t sub, uint32_t offset, uint32_t raw, const void *payload, uint32_t len) {
+  double t0 = now_ms();
+  if (send_cmd(l, QD_AUDIO, sub, offset, raw, payload, len)) link_lost("write-audio");
+  if (wait_ack(l, l->seq, ACK_TRIES)) {
+    audio_reply(sub, "timeout", t0);
+    return -1;
+  }
+  audio_reply(sub, NULL, t0);
+  return reply_body[0] ? -2 : 0;
+}
+
+static int audio_data(link_t *l, uint32_t offset, const uint8_t *payload, uint32_t len) {
+  double t0 = now_ms();
+  if (send_cmd(l, QD_AUDIO_DATA, 0, offset, len, payload, len)) link_lost("write-audio-data");
+  if (wait_ack(l, l->seq, ACK_TRIES)) {
+    json("{\"event\":\"audio-data\",\"n\":%u,\"ok\":0,\"offset\":%u,\"err\":\"timeout\"}", ++audio_n, offset);
+    return -1;
+  }
+  json("{\"event\":\"audio-data\",\"n\":%u,\"ok\":%d,\"status\":%u,\"offset\":%u,\"sent\":%u,\"detail\":%u,\"ms\":%u}",
+       ++audio_n, reply_body[0] == 0, reply_body[0], offset, len, reply_body[5],
+       (uint32_t)(now_ms() - t0));
+  return reply_body[0] ? -2 : 0;
+}
+
+static int audio_pcm(link_t *l, const uint8_t *payload, uint32_t len) {
+  double t0 = now_ms();
+  if (send_cmd(l, QD_PCM, 0, 0, len, payload, len)) link_lost("write-pcm");
+  if (wait_ack(l, l->seq, ACK_TRIES)) {
+    json("{\"event\":\"pcm\",\"n\":%u,\"ok\":0,\"err\":\"timeout\"}", ++audio_n);
+    return -1;
+  }
+  json("{\"event\":\"pcm\",\"n\":%u,\"ok\":%d,\"status\":%u,\"detail\":%u,\"ms\":%u}", ++audio_n,
+       reply_body[0] == 0, reply_body[0], reply_body[5], (uint32_t)(now_ms() - t0));
+  return reply_body[0] ? -2 : 0;
+}
+
 static int read_exact(void *buf, size_t len) {
   uint8_t *p = buf;
   while (len) {
@@ -514,9 +589,29 @@ int main(int argc, char **argv) {
   if (env) iface = atoi(env);
   debug = getenv("CS80_DEBUG") != NULL;
   const char *probe = NULL;
+  const char *hello = NULL;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--com") && i + 1 < argc) arg_com = argv[++i];
     else if (!strcmp(argv[i], "--probe")) probe = "1";
+    else if (!strcmp(argv[i], "--hello")) {
+      hello = "1";
+      if (i + 1 < argc && !strncmp(argv[i + 1], "COM", 3)) arg_com = argv[++i];
+    }
+  }
+  if (hello) { /* 只验一个端口（host 用来排除注册表里残留的旧 COM） */
+    link_t t;
+    memset(&t, 0, sizeof t);
+    if (open_link(&t, iface)) {
+      printf("{\"com\":\"%s\",\"qdc1\":false,\"err\":\"open\"}\n", arg_com ? arg_com : "");
+      return 1;
+    }
+    reply_body[0] = reply_body[5] = 0;
+    send_cmd(&t, QD_HELLO, 0, 0, 0, NULL, 0);
+    int ok = !wait_ack(&t, t.seq, 3) && reply_body[0] == 0;
+    printf("{\"com\":\"%s\",\"qdc1\":%s,\"block\":%u}\n", arg_com ? arg_com : "",
+           ok ? "true" : "false", ok ? reply_body[5] : 0);
+    close_link(&t);
+    return ok ? 0 : 1;
   }
   if (probe) { /* 逐个端口发 HELLO，找出哪个是 QDC1 数据口 */
     int hits = 0;
@@ -628,6 +723,42 @@ int main(int argc, char **argv) {
       } else {
         json("{\"event\":\"control\",\"ok\":0,\"err\":\"unknown-cmd\"}");
       }
+    } else if (type == 0x05) { /* 音频控制（type 7） */
+      uint8_t h[16];
+      if (read_exact(h, sizeof h)) break;
+      uint8_t sub = h[0];
+      uint32_t len = rd32(h + 4), offset = rd32(h + 8), raw = rd32(h + 12);
+      if (len > AUDIO_CHUNK) {
+        json("{\"event\":\"audio\",\"sub\":%u,\"ok\":0,\"err\":\"too-large\"}", sub);
+        break;
+      }
+      static uint8_t *abuf;
+      if (!abuf) abuf = malloc(AUDIO_CHUNK);
+      if (len && read_exact(abuf, len)) break;
+      audio_cmd(&l, sub, offset, raw, len ? abuf : NULL, len);
+    } else if (type == 0x06) { /* MP3 上传块（type 8） */
+      uint8_t h[8];
+      if (read_exact(h, sizeof h)) break;
+      uint32_t offset = rd32(h), len = rd32(h + 4);
+      if (!len || len > AUDIO_CHUNK) {
+        json("{\"event\":\"audio-data\",\"ok\":0,\"err\":\"bad-length\"}");
+        break;
+      }
+      static uint8_t *dbuf;
+      if (!dbuf) dbuf = malloc(AUDIO_CHUNK);
+      if (read_exact(dbuf, len)) break;
+      audio_data(&l, offset, dbuf, len);
+    } else if (type == 0x07) { /* 实时 PCM（type 9） */
+      uint32_t len = 0;
+      if (read_exact(&len, 4)) break;
+      if (!len || len > AUDIO_CHUNK || (len & 1u)) {
+        json("{\"event\":\"pcm\",\"ok\":0,\"err\":\"bad-length\"}");
+        break;
+      }
+      static uint8_t *pbuf;
+      if (!pbuf) pbuf = malloc(AUDIO_CHUNK);
+      if (read_exact(pbuf, len)) break;
+      audio_pcm(&l, pbuf, len);
     } else {
       fprintf(stderr, "cs80: 未知消息类型 %#x\n", type);
       break;

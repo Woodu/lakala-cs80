@@ -17,8 +17,10 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -437,7 +439,8 @@ def _windows_qdc1_com():
 def _probe_qdc1():
     """兜底：让 sidecar 自带探针逐个 COM 发 HELLO，返回真应答的那个口。"""
     try:
-        out = subprocess.run([SIDECAR, "--probe"], capture_output=True, text=True, timeout=120)
+        out = subprocess.run([SIDECAR, "--probe"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=120)
     except Exception:
         return ""
     for line in (out.stdout or "").splitlines():
@@ -451,6 +454,78 @@ def _probe_qdc1():
         if ev.get("qdc1"):
             return str(ev.get("com") or "")
     return ""
+
+
+def _check_qdc1(com):
+    """只验一个 COM（sidecar --hello）。注册表里可能残留拔插前的旧口（COM15），
+    光看 SERIALCOMM 不够，必须真发一次 HELLO 才能确认它就是 QDC1 数据口。"""
+    try:
+        out = subprocess.run([SIDECAR, "--hello", com], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=8)
+    except Exception:
+        return False
+    for line in (out.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return bool(json.loads(line).get("qdc1"))
+            except Exception:
+                return False
+    return False
+
+
+# ---------------- 音频（喇叭）----------------
+# 固件 QDC1 type 7 的子命令（flags）
+AUDIO_QUERY, AUDIO_STOP, AUDIO_VOLUME, AUDIO_BEGIN, AUDIO_END, AUDIO_PLAY, AUDIO_VERIFY = range(7)
+AUDIO_CHUNK = 16384          # type 8/9 单块上限（固件约定 1..16384）
+AUDIO_MAX = 4 * 1024 * 1024  # demo 固件的上传上限
+
+
+def _rotl32(x, n):
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
+
+
+def xxh32(data, seed=0):
+    """标准 xxHash32（seed 0），和设备侧 / sidecar 的 XXH32 一致。
+
+    只在音频上传时用来算整个 MP3 的哈希；4 MiB 纯 Python 大约 1–2 秒，
+    结果按 (路径, 大小, mtime) 缓存，重复播放不会再算。
+    """
+    try:  # 装了 xxhash 就快得多（可选依赖）
+        import xxhash  # type: ignore
+        return xxhash.xxh32(data, seed=seed).intdigest()
+    except Exception:
+        pass
+    P1, P2, P3, P4, P5 = 2654435761, 2246822519, 3266489917, 668265263, 374761393
+    n = len(data)
+    p = 0
+    if n >= 16:
+        v1 = (seed + P1 + P2) & 0xFFFFFFFF
+        v2 = (seed + P2) & 0xFFFFFFFF
+        v3 = seed & 0xFFFFFFFF
+        v4 = (seed - P1) & 0xFFFFFFFF
+        limit = n - 16
+        while p <= limit:
+            v1 = (_rotl32((v1 + int.from_bytes(data[p:p + 4], "little") * P2) & 0xFFFFFFFF, 13) * P1) & 0xFFFFFFFF
+            v2 = (_rotl32((v2 + int.from_bytes(data[p + 4:p + 8], "little") * P2) & 0xFFFFFFFF, 13) * P1) & 0xFFFFFFFF
+            v3 = (_rotl32((v3 + int.from_bytes(data[p + 8:p + 12], "little") * P2) & 0xFFFFFFFF, 13) * P1) & 0xFFFFFFFF
+            v4 = (_rotl32((v4 + int.from_bytes(data[p + 12:p + 16], "little") * P2) & 0xFFFFFFFF, 13) * P1) & 0xFFFFFFFF
+            p += 16
+        h = (_rotl32(v1, 1) + _rotl32(v2, 7) + _rotl32(v3, 12) + _rotl32(v4, 18)) & 0xFFFFFFFF
+    else:
+        h = (seed + P5) & 0xFFFFFFFF
+    h = (h + n) & 0xFFFFFFFF
+    while p + 4 <= n:
+        h = (_rotl32((h + int.from_bytes(data[p:p + 4], "little") * P3) & 0xFFFFFFFF, 17) * P4) & 0xFFFFFFFF
+        p += 4
+    while p < n:
+        h = (_rotl32((h + data[p] * P5) & 0xFFFFFFFF, 11) * P1) & 0xFFFFFFFF
+        p += 1
+    h ^= h >> 15
+    h = (h * P2) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * P3) & 0xFFFFFFFF
+    return (h ^ (h >> 16)) & 0xFFFFFFFF
 
 
 class Device:
@@ -468,6 +543,8 @@ class Device:
         self.bright_expect = None    # 我们刚发出去、还没确认的值
         self.need_restore = False    # 刚(重)连上：第一条 state 用来“恢复偏好”，不拿来学习
         self.com = ""  # Windows：QDC1 数据串口（自动从注册表识别）
+        self.audio_lock = threading.Lock()  # 上传/播放串行，避免两个请求交错
+        self._audio_hash = {}  # (路径, 大小, mtime) → XXH32，重复播放不重算
         threading.Thread(target=self._supervise, daemon=True).start()
         threading.Thread(target=self._poll_state, daemon=True).start()
 
@@ -486,7 +563,20 @@ class Device:
         err = open(SIDECAR_LOG, "ab")
         cmd = [SIDECAR]
         if os.name == "nt":
-            com = os.environ.get("CS80_COM") or self.com or _windows_qdc1_com()
+            env_com = os.environ.get("CS80_COM")
+            com = env_com
+            if com and not _check_qdc1(com):
+                # 显式指定也可能过期（拔插后 COM 号会变）：不应答就回退到自动探测
+                print("CS80: CS80_COM=%s 不应答 QDC1，改为自动探测" % com, flush=True)
+                com = ""
+            if not com:
+                # 依次验证：上次用的口 → 注册表映射的口；都不应答再全盘扫描。
+                # 注册表在拔插/重枚举后会残留旧实例（比如 COM15），不能直接信任。
+                active = _active_coms()
+                for cand in (self.com, _windows_qdc1_com()):
+                    if cand and (not active or cand.upper() in active) and _check_qdc1(cand):
+                        com = cand
+                        break
             if not com:
                 com = _probe_qdc1()
             if not com:
@@ -517,9 +607,12 @@ class Device:
                 ev = json.loads(line)
             except Exception:
                 continue
-            self.last = ev
-            self.last_event = time.time()
             name = ev.get("event")
+            self.last_event = time.time()
+            # 音频事件很多（上传时每块一条），不要把“最近事件”挤成 audio；
+            # 它们只进 status["audio"]，供 UI 的喇叭状态显示。
+            if name not in ("audio", "audio-data", "pcm"):
+                self.last = ev
             if name == "ready":
                 self.status = dict(self.status, device="up", ready=ev)
                 if BRIGHTNESS_PIN:
@@ -543,6 +636,9 @@ class Device:
                 self.status = dict(self.status, **{name: {k: v for k, v in ev.items() if k != "event"}})
                 if name == "state":
                     self._bright_state(ev.get("brightness"))
+            elif name in ("audio", "audio-data", "pcm"):
+                # 音频事件带自增 n，上传流程用它做同步；status 里保留最后一条供 UI 显示
+                self.status = dict(self.status, audio=ev, audio_n=ev.get("n"))
         proc.wait()
         if self.proc is proc:
             self.proc = None
@@ -604,6 +700,8 @@ class Device:
                         backoff = 1.0
                     else:
                         self.status = dict(self.status, device="down", reason="open-failed")
+                        if os.name == "nt" and not os.environ.get("CS80_COM"):
+                            self.com = ""   # 下次重新探测（别在错的 COM 上死循环）
                         if self.proc is not None:
                             self.proc.kill()
                         time.sleep(backoff)
@@ -646,6 +744,108 @@ class Device:
 
     def control(self, cmd, arg=0):
         return self.send(b"\x03" + bytes([cmd, arg]))
+
+    # ---- 音频（喇叭）----
+    def _wait_audio(self, n0, sub=None, timeout=10.0):
+        """等 sidecar 的音频事件（带自增 n），避免和上一次命令的回包搞混。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ev = self.status.get("audio") or {}
+            if ev.get("n", 0) > n0 and (sub is None or ev.get("sub") == sub):
+                return ev
+            time.sleep(0.005)
+        return None
+
+    def audio(self, sub, offset=0, raw=0, payload=b"", timeout=15.0):
+        """发一条 QDC1 type 7（音频控制），返回设备 ACK 解析后的事件。"""
+        n0 = int(self.status.get("audio_n") or 0)
+        msg = b"\x05" + bytes([sub, 0, 0, 0]) + struct.pack("<III", len(payload), offset, raw) + payload
+        if not self.send(msg):
+            return {"ok": False, "err": "device-down"}
+        ev = self._wait_audio(n0, sub, timeout)
+        return ev or {"ok": False, "err": "timeout"}
+
+    def audio_block(self, offset, chunk):
+        """发一块 MP3（type 8），等这一块的 ACK（detail = 累计字节）。"""
+        n0 = int(self.status.get("audio_n") or 0)
+        msg = b"\x06" + struct.pack("<II", offset, len(chunk)) + chunk
+        if not self.send(msg):
+            return {"ok": False, "err": "device-down"}
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            ev = self.status.get("audio") or {}
+            if ev.get("n", 0) > n0 and ev.get("event") == "audio-data" and ev.get("offset") == offset:
+                return ev
+            time.sleep(0.005)
+        return {"ok": False, "err": "timeout"}
+
+    def _upload_locked(self, data, h):
+        """调用方已持有 audio_lock：开始上传 → 分块 → 结束并核对文件哈希。"""
+        r = self.audio(AUDIO_BEGIN, offset=len(data), raw=h, timeout=20)
+        if not r.get("ok"):
+            return r
+        for off in range(0, len(data), AUDIO_CHUNK):
+            r = self.audio_block(off, data[off:off + AUDIO_CHUNK])
+            if not r.get("ok"):
+                return dict(r, offset=off)
+        r = self.audio(AUDIO_END, timeout=30)
+        if not r.get("ok"):
+            return r
+        got = r.get("detail")
+        if got and got != h:
+            return {"ok": False, "err": "hash-mismatch", "expect": h, "got": got}
+        return {"ok": True, "size": len(data), "hash": h}
+
+    def upload_mp3(self, data):
+        if not data:
+            return {"ok": False, "err": "empty"}
+        if len(data) > AUDIO_MAX:
+            return {"ok": False, "err": "too-large"}
+        h = xxh32(data)
+        with self.audio_lock:
+            return self._upload_locked(data, h)
+
+    def play_file(self, path):
+        """上传（设备上已有同哈希文件则跳过）并播放一个 MP3。"""
+        path = os.path.abspath(path)
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            return {"ok": False, "err": str(exc)}
+        if st.st_size > AUDIO_MAX:
+            return {"ok": False, "err": "too-large"}
+        with open(path, "rb") as f:
+            data = f.read()
+        key = (path, st.st_size, int(st.st_mtime))
+        h = self._audio_hash.get(key)
+        if h is None:
+            h = xxh32(data)
+            self._audio_hash[key] = h
+        with self.audio_lock:
+            v = self.audio(AUDIO_VERIFY, timeout=15)
+            if not (v.get("ok") and v.get("detail") == h):
+                r = self._upload_locked(data, h)
+                if not r.get("ok"):
+                    return r
+            r = self.audio(AUDIO_PLAY, timeout=20)
+            return dict(r, size=len(data), hash=h)
+
+
+def tts_mp3(text):
+    """macOS：用 say 生成语音，再让 ffmpeg 转成设备能解的 MP3。"""
+    if sys.platform != "darwin":
+        raise RuntimeError("say 播报只在 macOS 可用；其它平台请直接上传 MP3")
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("需要 ffmpeg 才能把语音转成 MP3（brew install ffmpeg）")
+    with tempfile.TemporaryDirectory() as d:
+        aiff, mp3 = os.path.join(d, "say.aiff"), os.path.join(d, "say.mp3")
+        subprocess.run(["say", "-o", aiff, text], check=True, timeout=60)
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", aiff, "-codec:a", "libmp3lame", "-q:a", "5", mp3],
+            check=True, timeout=120,
+        )
+        with open(mp3, "rb") as f:
+            return f.read()
 
 
 # ---------------- 数据源 ----------------
@@ -1784,6 +1984,51 @@ class Handler(BaseHTTPRequestHandler):
             with open(WEB_LOG, "a", encoding="utf-8") as f:
                 f.write(time.strftime("%H:%M:%S ") + text + "\n")
             return self._send(200, {"ok": True})
+        if url.path == "/api/audio/file":
+            # 浏览器直接 POST 原始 MP3 字节；?play=1 时传完就播
+            data = self.rfile.read(n)
+            if not data:
+                return self._send(400, {"error": "empty body"})
+            if len(data) > AUDIO_MAX:
+                return self._send(413, {"error": "MP3 最大 4 MiB"})
+            r = self.device.upload_mp3(data)
+            if r.get("ok") and "play" in urllib.parse.parse_qs(url.query):
+                p = self.device.audio(AUDIO_PLAY, timeout=20)
+                return self._send(200 if p.get("ok") else 500, {"ok": bool(p.get("ok")), "upload": r, "play": p})
+            return self._send(200 if r.get("ok") else 500, {"ok": bool(r.get("ok")), "upload": r})
+        if url.path == "/api/audio":
+            body = json.loads(self.rfile.read(n) or b"{}")
+            action = str(body.get("action") or "query")
+            if action == "query":
+                ev = self.device.audio(AUDIO_QUERY)
+            elif action == "stop":
+                ev = self.device.audio(AUDIO_STOP)
+            elif action == "volume":
+                v = max(0, min(100, int(body.get("value") or 0)))
+                ev = self.device.audio(AUDIO_VOLUME, offset=v)
+            elif action == "play":
+                ev = self.device.play_file(body["file"]) if body.get("file") else self.device.audio(AUDIO_PLAY, timeout=20)
+            elif action == "verify":
+                ev = self.device.audio(AUDIO_VERIFY)
+            elif action == "upload":
+                if not body.get("file"):
+                    return self._send(400, {"error": "upload 需要 file 路径；浏览器请用 POST /api/audio/file"})
+                try:
+                    with open(body["file"], "rb") as f:
+                        data = f.read()
+                except OSError as exc:
+                    return self._send(400, {"error": str(exc)})
+                ev = self.device.upload_mp3(data)
+            elif action == "say":
+                try:
+                    data = tts_mp3(str(body.get("text") or ""))
+                except Exception as exc:
+                    return self._send(400, {"error": str(exc)})
+                r = self.device.upload_mp3(data)
+                ev = dict(self.device.audio(AUDIO_PLAY, timeout=20), upload=r) if r.get("ok") else r
+            else:
+                return self._send(400, {"error": "unknown action"})
+            return self._send(200 if ev.get("ok") else 500, {"ok": bool(ev.get("ok")), "audio": ev})
         if url.path == "/api/control":
             body = json.loads(self.rfile.read(n) or b"{}")
             cmd = {"brightness": 1, "sleep": 2, "wake": 3, "state": 4, "hello": 5}.get(body.get("cmd"))
@@ -1828,7 +2073,10 @@ def main():
         if not args.no_device
         else type("D", (), {"status": {"device": "none"}, "last": None, "session": 0,
                             "user_brightness": None, "status_note": "no-device",
-                            "send": lambda *a: False, "control": lambda *a: False})()
+                            "send": lambda *a: False, "control": lambda *a: False,
+                            "audio": lambda *a, **k: {"ok": False, "err": "no-device"},
+                            "upload_mp3": lambda *a, **k: {"ok": False, "err": "no-device"},
+                            "play_file": lambda *a, **k: {"ok": False, "err": "no-device"}})()
     )
     Handler.device = device
     global SAVER

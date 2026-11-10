@@ -45,6 +45,9 @@
 | 3 | DATA（裸块 ≤508 KiB） | 0 | 块偏移 | 块长度 | 未压缩像素 |
 | 4 | COMMIT | **1** | 整帧像素哈希 | 0 | — |
 | 6 | VERIFY | 0 | — | — | — → `detail=framebuffer 的 XXH32` |
+| 7 | AUDIO | 子命令 | 见下 | 见下 | 音频控制/播放/音量（空 payload） |
+| 8 | AUDIO_DATA | 0 | MP3 累计字节 | 块长 1..16384 | MP3 上传块 |
+| 9 | AUDIO_PCM | 0 | 0 | 块长（偶数，1..16384） | signed PCM16LE 实时流 |
 | 10 | PATCH（局部） | 1 | 上一帧哈希 | 8+n×1032 | LZ4(8B 头 + n 个 tile) |
 
 局部 patch 的明文结构：`u32 targetHash` + `u32 count` + count ×（`u16 x,u16 y,u16 w,u16 h` + 32×16×2 字节像素），
@@ -62,7 +65,31 @@
    2026-11 实测：整帧单块 LZ4 在内容丰富（带走势图）时压出来 >512 KB → `no-ack-data` 死循环、
    屏一直停在等待页；改成按块压缩后同一画面立刻恢复（整帧 ≈ 200 KB / 4 包）。
 
-## 4. sidecar（`panel/qdc1.c`）stdin 协议
+## 4. 音频（喇叭）
+
+固件 **0.3.0 就带音频**（`HELLO(flags=2)` 的 `detail=0x23f` 里 bit2=文件音频、bit3=PCM），
+PA 使能（QL GPIO22）由固件渲染任务按「播放请求 + speaker 路由 + 非零音量」自动开关，
+主机不需要碰 GPIO。当前只支持 **MP3 文件**（存到设备 `UFS:qdisplay_audio.mp3`，上限 4 MiB）。
+
+`type=7` 是空 payload 的控制命令，`flags` 为子命令：
+
+| flags | offset / raw_length | 行为 / ACK 关键字段 |
+|---|---|---|
+| 0 | 0 / 0 | 查询：`receive`=音量百分比，`decode`=播放状态，`draw`=事件，`detail=0x31445541`（AUD1） |
+| 1 | 0 / 0 | 停止播放 + 终止上传 |
+| 2 | 0..100 / 0 | 设音量，`detail`=百分比 |
+| 3 | 文件总字节 / 文件 XXH32 | 开始上传（上限 4 MiB），`detail`=文件大小 |
+| 4 | 0 / 0 | 结束上传：校验哈希并改名，`detail`=文件哈希 |
+| 5 | 0 / 0 | 播放 UFS 里的文件：`receive`=音量、`decode`=硬件档、`draw`=路由、`detail`=文件字节数 |
+| 6 | 0 / 0 | 读回设备上实际保存的文件：`receive`=字节数，`detail`=XXH32 |
+| 7 | 16000 / 1 | 开始 16 kHz 单声道 PCM，等首块（type 9） |
+| 8 | 0 / 0 | 只读：路由/档位/PA/增益诊断 |
+| 9 | 0..2 / 0 | 停止后改路由（正常用 speaker，诊断用） |
+
+上传流程：`7/3` → 循环 `type=8`（每块 ≤16384 B，等 ACK，`detail`=累计字节）→ `7/4` →
+可选 `7/6` 核对 → `7/5` 播放。音频与显示共用同一条命令流，**必须串行**（本仓由 sidecar 单线程读 stdin 保证）。
+
+## 5. sidecar（`panel/qdc1.c`）stdin 协议
 
 上位机和 USB 之间由这个 C 程序隔开，它独占设备，因此**任何时候只能有一个进程持有 USB**。
 
@@ -72,9 +99,12 @@
 | `0x02` | `u32 n` + n×(`u16 x,u16 y`,1024 B BGR565) | 局部 tile：应用到影子 framebuffer → 算新哈希 → PATCH |
 | `0x03` | `u8 cmd` + `u8 arg` | 控屏：`1` 亮度 / `2` 待机 / `3` 唤醒 / `4` 查状态 / `5` 握手 |
 | `0x04` | 800×1280×2 B BGR565 | 屏保用：跳过 RGB 转换直接整帧 |
+| `0x05` | `u8 sub` + 3 B 保留 + `u32 len` + `u32 offset` + `u32 raw` + payload | 音频控制（QDC1 type 7，sub 见上表） |
+| `0x06` | `u32 offset` + `u32 len` + payload | MP3 上传块（type 8，len≤16384） |
+| `0x07` | `u32 len` + payload | 实时 PCM（type 9，len≤16384 且为偶数） |
 
-stdout 每条命令一行 JSON（`ready/features/frame/patch/saver/keepalive/lost/brightness/state`），
-host 转发给前端做状态面板。
+stdout 每条命令一行 JSON（`ready/features/frame/patch/saver/keepalive/lost/brightness/state/audio/audio-data/pcm`），
+host 转发给前端做状态面板。音频事件带自增 `n`，host 用它做命令/回包配对。
 
 sidecar 负责的三件额外的事：
 
@@ -82,7 +112,7 @@ sidecar 负责的三件额外的事：
 - **链路看门狗**：任何命令 2 秒等不到 ACK（或写失败）→ 判定 USB 链路已死 → `exit(3)`，交给 host 重新枚举
 - **patch 链**：本地维护影子 framebuffer，`PATCH` 的 `offset` 必须是设备上一帧的哈希，对不上固件会 `status=4`
 
-## 5. 实测数字（MacBook + CS80）
+## 6. 实测数字（MacBook + CS80）
 
 | 路径 | 数据量 | 耗时 |
 |---|---|---|

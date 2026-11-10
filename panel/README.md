@@ -6,7 +6,7 @@
    │ 每次只把脏的 32×16 tile 发出去
    ▼
 host.py  ── 独占 USB 的常驻进程（HTTP :8787 + 数据源 + 屏保 + 锁屏监听）
-   │ stdin 三条二进制消息：整帧 RGB / 局部 tile / 控屏（+ 屏保整帧 BGR565）
+   │ stdin 二进制消息：整帧 RGB / 局部 tile / 控屏 / 屏保整帧 / 音频（type 7·8·9）
    ▼
 qdc1（C sidecar，单进程独占设备；macOS=IOKit，Windows=COM 口）
    ▼
@@ -35,8 +35,8 @@ un-windows.cmd        # Windows：host + Edge/Chrome 应用窗口（无地址栏
 ## 文件
 
 ```
-qdc1.c / lz4.c / lz4.h      USB sidecar（QDC1 协议、LZ4、影子 framebuffer、保活、看门狗）
-host.py                     常驻 host：HTTP API、数据源、Agent 扫描、屏保(ffmpeg)、锁屏监听、静态资源
+qdc1.c / lz4.c / lz4.h      USB sidecar（QDC1 协议、LZ4、影子 framebuffer、保活、看门狗、音频上传/播放）
+host.py                     常驻 host：HTTP API、数据源、Agent 扫描、屏保(ffmpeg)、锁屏监听、喇叭（MP3→UFS）、静态资源
 web/index.html  styles.css  编辑器骨架 + 设计系统（token 来自 glance 的暗色中性 + 金色 accent）
 web/widgets.js              全部组件 + 卡片外壳 card() + 主题 THEME
 web/pages/*.js              自定义页面（示例：自选股 + 分时图）
@@ -132,6 +132,29 @@ export default {
 - 状态色：运行中（绿，呼吸）/ 等待（琥珀，呼吸）/ 异常退出（红）/ 1 小时内结束（蓝）/ 更早（灰）
 - 排序：运行中 → 等待 → 异常 → 已结束，组内按最近活动倒序；无滚动条，按高度取行数
 - 配置项是两级勾选树：整组隐藏某个 Agent，或只隐藏某一条会话（`config.hide` / `config.hideTasks`）
+
+## 喇叭
+
+固件 0.3.0 自带音频通路（`features=0x23f` 的 bit2），PA（QL GPIO22）由固件自己开关，
+所以**不需要重刷固件**，主机侧只要把 MP3 传上去再触发播放。
+
+- UI：侧栏「设备」卡片 → **选择 MP3 并播放** / **停止**（文件最大 4 MiB）
+- `POST /api/audio/file?play=1`：body 直接是 MP3 字节 → 上传完自动播放（浏览器用这个）
+- `POST /api/audio`（JSON）：
+
+| action | 参数 | 说明 |
+|---|---|---|
+| `query` | — | 音量 / 播放状态 / 路由（`detail=0x31445541` = AUD1） |
+| `stop` | — | 停止播放并终止上传 |
+| `volume` | `value` 0..100 | 设音量 |
+| `play` | `file`（可选） | 无 `file` 播设备上已有文件；有则先上传（哈希相同会跳过）再播 |
+| `upload` | `file` | 只上传，不播放 |
+| `verify` | — | 读回设备文件大小 / XXH32 |
+| `say` | `text` | macOS：`say` + `ffmpeg` 合成 MP3 后播放 |
+
+实现：sidecar `0x05/0x06` → QDC1 `type 7/8`；主机按 16 KiB 分块上传并逐块等 ACK，
+文件 XXH32 在 Python 里算（装了 `xxhash` 会更快），按路径+大小+mtime 缓存。
+音频和画面共用一条命令流，`Device.audio_lock` 保证上传/播放不会互相穿插。
 
 ## 屏保
 

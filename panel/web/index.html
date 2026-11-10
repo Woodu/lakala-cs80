@@ -77,6 +77,14 @@
         <button class="btn btn-sm" data-color="blue">蓝</button>
         <button class="btn btn-sm" data-color="black">黑</button>
       </div>
+      <div class="row wrap" style="margin-top:8px" id="audio-row"
+           title="喇叭：MP3 最大 4 MiB，先上传到设备 UFS 再播放（固件 0.3.0 已带音频通路）">
+        <span class="hint" style="width:100%">喇叭</span>
+        <button class="btn btn-sm" id="btn-audio-pick">选择 MP3 并播放</button>
+        <button class="btn btn-sm" id="btn-audio-stop">停止</button>
+        <input type="file" id="audio-file" accept="audio/mpeg,.mp3" hidden>
+        <span class="hint" id="audio-state" style="width:100%">—</span>
+      </div>
     </div>
 
     <div class="section-label">画布</div>

@@ -63,10 +63,15 @@ function paintDevice(st) {
   // 0x40 = QD_FEATURE_SCREEN_POWER：0.3.1 起才有（等待页也开始每秒重画倒计时）
   const fw = typeof bits === 'number' ? (bits & 0x40 ? '0.3.1+' : '0.3.0') : '—';
   const pwm = typeof edges === 'number' ? (edges ? `运行 ${edges}` : '停（100%）') : '—';
+  const au = st.audio || {};
+  const audioLabel = au.event === 'audio'
+    ? (au.ok ? `OK${typeof au.ms === 'number' ? ' ' + au.ms + 'ms' : ''}` : (au.err || 'FAIL'))
+    : '—';
   el('#device-detail').innerHTML = up
     ? `块大小 <code>${(st.ready && st.ready.block) || '—'}</code><br>
        特性位 <code>${typeof bits === 'number' ? '0x' + bits.toString(16) : '—'}</code> · 固件 <code>${fw}</code><br>
        背光 <code>${typeof b === 'number' ? b + '%' : '—'}</code> · PWM <code>${pwm}</code><br>
+       喇叭 <code>${audioLabel}</code><br>
        session <code>${st.session ?? '—'}</code> · 最近事件 <code>${side.event || '—'}</code>
        ${side.wire ? ` · ${side.wire} B` : ''}`
     : `未连上设备${st.reason ? '（' + st.reason + '）' : ''}<br>检查 Type-C 数据线 / 供电 / 官方上位机是否占着串口。<br>
@@ -140,6 +145,38 @@ async function boot() {
   };
   el('#btn-sleep').onclick = () => postJson('/api/control', { cmd: 'sleep' }).then(() => toast('已待机'));
   el('#btn-wake').onclick = () => postJson('/api/control', { cmd: 'wake' }).then(() => toast('已唤醒'));
+  // 喇叭：选一个本地 MP3 → 原样 POST 给 host（它再分块传给设备）→ 上传完自动播放
+  el('#btn-audio-pick').onclick = () => el('#audio-file').click();
+  el('#audio-file').addEventListener('change', async (ev) => {
+    const f = ev.target.files[0];
+    ev.target.value = '';
+    if (!f) return;
+    if (f.size > 4 * 1024 * 1024) return toast('MP3 最大 4 MiB', 'warn');
+    el('#audio-state').textContent = `上传中… ${(f.size / 1024).toFixed(0)} KB`;
+    try {
+      const res = await fetch('/api/audio/file?play=1', {
+        method: 'POST',
+        headers: { 'Content-Type': 'audio/mpeg' },
+        body: f,
+      });
+      const j = await res.json();
+      if (!j.ok) throw new Error((j.play && j.play.err) || (j.upload && j.upload.err) || '播放失败');
+      el('#audio-state').textContent = `播放中 · ${(f.size / 1024).toFixed(0)} KB`;
+      toast('喇叭开始播放');
+    } catch (e) {
+      el('#audio-state').textContent = '失败';
+      toast('喇叭：' + e.message, 'warn');
+    }
+  });
+  el('#btn-audio-stop').onclick = async () => {
+    try {
+      const j = await postJson('/api/audio', { action: 'stop' });
+      el('#audio-state').textContent = j.ok ? '已停止' : '停止失败';
+      toast(j.ok ? '喇叭已停止' : '喇叭停止失败', j.ok ? 'info' : 'warn');
+    } catch (e) {
+      toast('喇叭：' + e.message, 'warn');
+    }
+  };
   el('#btn-full').onclick = () => {
     pusher.markFull();
     toast('整帧重推');

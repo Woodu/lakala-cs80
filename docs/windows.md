@@ -1,6 +1,6 @@
 # 在 Windows 上验证 / 运行（面板版）
 
-macOS 侧已经全部实测通过（数字见 [`protocol.md`](protocol.md) §5）。Windows 侧 **host + sidecar + 推帧已实测通过**（§0.5；Tauri 桌面壳还没在 Windows 打包验证），
+macOS 侧已经全部实测通过（数字见 [`protocol.md`](protocol.md) §6）。Windows 侧 **host + sidecar + 推帧已实测通过**（§0.5；Tauri 桌面壳还没在 Windows 打包验证），
 下面是从零到验收的完整步骤，以及每一步失败该怎么查。整个过程约 20 分钟。
 
 ---
@@ -24,7 +24,7 @@ macOS 侧已经全部实测通过（数字见 [`protocol.md`](protocol.md) §5�
 
 | 模块 | Windows 实现 | 说明 |
 |---|---|---|
-| USB 数据口 | **自动识别**：读注册表 `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_2C7C&PID_0901&MI_20\*\Device Parameters\PortName` | 不用手填 `CS80_COM`；要覆盖就 `set CS80_COM=COMxx`（或 `--com COMxx`） |
+| USB 数据口 | **自动识别**：注册表映射 + `qdc1.exe --hello` 真发一次 HELLO 校验；不对就 `--probe` 全盘扫 | 不用手填 `CS80_COM`。`set CS80_COM=COMxx` 仍可覆盖，但会先校验：不应答就自动回退到探测（拔插后 COM 号会变，旧值不会再把你卡死） |
 | sidecar | `panel/qdc1.exe`（VS2022 `cl` 编译；源里修了 MSVC 编不过的 `ssize_t`），且每次读都按调用方超时 `SetCommTimeouts` | 否则一次读按 DCB 默认会阻塞 2 s，握手/保活容易被误判成“链路死” |
 | 系统指标 | `GetSystemTimes` + `GlobalMemoryStatusEx`（ctypes，无第三方包） | CPU/内存跟任务管理器口径一致 |
 | 网速 | `Get-NetRoute` 取默认路由网卡 → `Get-NetAdapterStatistics` | 不用 PowerShell 求和（虚拟网卡会把计数带飞） |
@@ -247,7 +247,7 @@ npx tauri build --config C:\path\to\winconf.json
 | 现象 | 原因 / 处理 |
 |---|---|
 | `host.py` 起来但 `device=no-sidecar` | `panel\qdc1.exe` 不存在或没编译 → 回到第 1 步 |
-| `device=down` 反复重启 | sidecar 打印的错误被吞了：直接跑 `panel\qdc1.exe < nul`（cmd；需要 `CS80_COM`），看 stderr。PowerShell 要写成 `cmd /c "qdc1.exe < nul"`（PS 把 `<` 当保留符号，报 `RedirectionNotSupported`） |
+| `device=down` 反复重启 | sidecar 打印的错误被吞了：直接跑 `panel\qdc1.exe < nul`（cmd；需要 `CS80_COM`），看 stderr。PowerShell 要写成 `cmd /c "qdc1.exe < nul"`（PS 把 `<` 当保留符号，报 `RedirectionNotSupported`）。**先确认 `CS80_COM` 不是拔插前的旧值**（`echo %CS80_COM%`）；现在 host 会校验它，不应答会自动探测 |
 | `打不开设备 (code=-1)` | 先查是不是官方上位机/`QDisplayDevice` 服务占着口（`Get-Service QDisplayDevice`），另外一个进程死掉后句柄可能还挂着 → 拔插 Type-C |
 | 屏上一直是「等待连接」页 | ① 没打开画布页面（窗口关了就没人推帧）② `CS80_COM` 指错口 ③ 固件不是 QDisplay |
 | `patch` 一直 `code=4` | 设备侧 committed 哈希与本机不一致（换过设备/固件重启）→ 点「整帧重推」 |
