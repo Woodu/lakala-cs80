@@ -433,8 +433,12 @@ function sparkline(ctx, x, y, w, h, data, color) {
   ctx.lineJoin = 'round';
   ctx.stroke();
 }
-/** 分时图：昨收虚线 + 涨跌面积/折线（box 用绝对坐标） */
-export function minuteChart(ctx, box, points, preClose, color) {
+/**
+ * 分时图：昨收虚线 + 涨跌面积/折线（box 用绝对坐标）。
+ * slots = 整个交易时段的分钟数（A 股 241 / 美股 391）：给了就按时间轴画，
+ * 盘中只画到当前进度、右边留白；不给就按现有数据铺满（期货/自定义页面）。
+ */
+export function minuteChart(ctx, box, points, preClose, color, slots) {
   if (!points || points.length < 2) {
     ctx.fillStyle = 'rgba(255,255,255,.18)';
     ctx.font = font(Math.max(10, box.h * 0.22), 400);
@@ -449,7 +453,8 @@ export function minuteChart(ctx, box, points, preClose, color) {
   const span0 = hi - lo || 1;
   lo -= span0 * 0.12;
   hi += span0 * 0.12;
-  const px = (i) => box.x + (i / (prices.length - 1)) * box.w;
+  const span = Math.max(prices.length - 1, (slots || prices.length) - 1);
+  const px = (i) => box.x + (i / span) * box.w;
   const py = (v) => box.y + box.h - ((v - lo) / (hi - lo)) * box.h;
 
   if (preClose) {
@@ -468,8 +473,8 @@ export function minuteChart(ctx, box, points, preClose, color) {
   ctx.beginPath();
   ctx.moveTo(px(0), py(prices[0]));
   prices.forEach((v, i) => ctx.lineTo(px(i), py(v)));
-  ctx.lineTo(box.x + box.w, box.y + box.h);
-  ctx.lineTo(box.x, box.y + box.h);
+  ctx.lineTo(px(prices.length - 1), box.y + box.h);
+  ctx.lineTo(px(0), box.y + box.h);
   ctx.closePath();
   ctx.fillStyle = grad;
   ctx.fill();
@@ -528,7 +533,8 @@ export function stockRow(ctx, r, item, t, opts = {}) {
       { x: sx, y: r.y + r.h * 0.2, w: sw, h: r.h * 0.62 },
       item.points,
       item.preClose ?? item.prev,
-      color
+      color,
+      opts.slots
     );
   }
 }
@@ -1065,9 +1071,12 @@ export const WIDGETS = {
       const perCell = Math.max(1, Math.round(r.h / CELLH));
       const rows = Math.max(1, Math.min(items.length, fit, perCell));
       const rowH = Math.min(200, (inner.h - gap * (rows - 1)) / rows);
+      // 盘中：分时图按整段时间轴画，只走到当前时刻，右边留白（一眼看出还在走）
+      const slots = { cn: 241, us: 391 }[session.id];
       for (let i = 0; i < rows; i++) {
         stockRow(ctx, { x: inner.x, y: inner.y + i * (rowH + gap), w: inner.w, h: rowH }, items[i], t, {
           card: false,
+          slots,
         });
       }
     },
