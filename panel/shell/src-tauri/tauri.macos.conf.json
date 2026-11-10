@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../../qdc1": "panel/qdc1"
+    }
+  }
+}

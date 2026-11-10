@@ -33,7 +33,6 @@
     "longDescription": "把拉卡拉 CS80 客显屏当 Agent 状态副屏：画布编辑器 + 常驻推帧。",
     "resources": {
       "../../host.py": "panel/host.py",
-      "../../qdc1": "panel/qdc1",
       "../../README.md": "panel/README.md",
       "../../web/index.html": "panel/web/index.html",
       "../../web/main.js": "panel/web/main.js",

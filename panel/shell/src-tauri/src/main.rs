@@ -49,6 +49,64 @@ fn panel_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+
+/// 找可用的 Python：环境变量 > 绑定的便携版（panel/py）> py -3 > python3 > python。
+/// Windows 上 `python` 往往是应用商店的占位程序（跑起来立刻退出），所以必须逐个试一下。
+fn probe_ok(cmd: &str, args: &[String]) -> bool {
+    let mut c = match Command::new(cmd)
+        .args(args)
+        .arg("-c")
+        .arg("import sys")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let start = Instant::now();
+    loop {
+        match c.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(5) {
+                    let _ = c.kill();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn python_cmd(dir: &PathBuf) -> (String, Vec<String>) {
+    if let Ok(p) = std::env::var("CS80_PYTHON") {
+        return (p, vec![]);
+    }
+    let mut cands: Vec<(String, Vec<String>)> = Vec::new();
+    let bundled = if cfg!(windows) {
+        dir.join("py").join("python.exe")
+    } else {
+        dir.join("py").join("bin").join("python3")
+    };
+    if bundled.exists() {
+        cands.push((bundled.to_string_lossy().to_string(), vec![]));
+    }
+    if cfg!(windows) {
+        cands.push(("py".to_string(), vec!["-3".to_string()]));
+    }
+    cands.push(("python3".to_string(), vec![]));
+    cands.push(("python".to_string(), vec![]));
+    for (c, a) in cands {
+        if probe_ok(&c, &a) {
+            return (c, a);
+        }
+    }
+    eprintln!("[cs80] 没找到可用的 Python（设 CS80_PYTHON 指向 python.exe）");
+    (if cfg!(windows) { "python".to_string() } else { "python3".to_string() }, vec![])
+}
+
 fn spawn_host() -> Option<Child> {
     if port_ready(PORT) {
         return None; // 已经有 host 在跑（比如手动起的），复用它
@@ -59,16 +117,10 @@ fn spawn_host() -> Option<Child> {
         eprintln!("[cs80] 找不到 {}（设 CS80_PANEL_DIR 指向 panel/ 目录）", script.display());
         return None;
     }
-    let python = std::env::var("CS80_PYTHON").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "python".to_string()
-        } else {
-            "python3".to_string()
-        }
-    });
+    let (python, py_args) = python_cmd(&dir);
     let log = std::fs::File::create(std::env::temp_dir().join("cs80_host.log")).ok();
     let mut cmd = Command::new(python);
-    cmd.arg(script)
+    cmd.args(&py_args).arg(script)
         .arg("--port")
         .arg(PORT.to_string())
         .current_dir(&dir)
