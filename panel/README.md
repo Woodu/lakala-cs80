@@ -24,7 +24,9 @@ open panel/shell/src-tauri/target/release/bundle/macos/"CS80 Panel.app"
 
 # 或者不打包：
 python3 panel/host.py        # 然后浏览器打开 http://127.0.0.1:8787
-sh panel/run.sh              # host + Chrome 应用窗口（会自动停掉旧的 launchd 服务）
+sh panel/run.sh              # macOS：host + Chrome 应用窗口（会自动停掉旧的 launchd 服务）
+panel
+un-windows.cmd        # Windows：host + Edge/Chrome 应用窗口（无地址栏，独立 profile）
 ```
 
 **必须常驻**：固件 5 秒收不到主机命令就回「等待连接」页。桌面壳把「关窗」改成「隐藏到托盘」，
@@ -62,9 +64,32 @@ add-screensaver.sh          把任意视频转成 800×1280 / 12 fps 放进屏�
 | GitHub | 1×1 | GitHub API（未授权 60 次/时） |
 | 天气 | 1×1 | open-meteo（可选 macOS 快捷指令，见下） |
 | 电脑指标 | 2×1 | `host_statistics64` CPU + `vm_stat` 内存 + 网速 |
-| RunCat | 2×2 / 5×2 | CPU/MEM 环 + 奔跑猫，速度随 CPU |
+| RunCat | 2×2 / 5×2 | CPU/MEM 环 + 奔跑猫，速度随 CPU；**右上角显示本机局域网 IP**（取默认路由网卡、会跳过 Clash/FlClash 的 198.18.x TUN 和 VMware 虚拟网卡；`cfg.meta: 'host'` 可改回主机名） |
 | 倒计时 | 1×1 | 本地计算 |
 | 便签 | 1×1 | 纯文本 |
+
+## 默认看板（新装即用）
+
+`host.py` 里的 `DEFAULT_LAYOUT` 就是新用户第一次打开看到的布局（没有 `~/.cs80_panel/layout.json` 时用它）：
+
+```
+ 0 ┌───────────────┬────────┐
+ 1 │ 时钟 3×2      │ RunCat │   时钟右上角带天气（默认城市：北京）
+   │ (月/日/农历)  │  2×2   │
+ 2 ├───────────────┴────────┤
+ 3 │ 自选股 5×2             │   新版多股组件：sz002654 万润科技 / sh600641 先导基电
+ 4 ├────────────────────────┤
+ 5 │                        │
+ 6 │ Agent 5×4             │   剩下的行数都给 Agent 会话列表
+ 7 │                        │
+   └────────────────────────┘
+```
+
+![默认看板](../docs/default-layout.png)
+
+改默认布局：直接改 `host.py` 的 `GRID_PAGE`（5 列 × 8 行，每格 160px，`cell = [列, 行, 宽, 高]`）；
+天气默认城市在 `widgets.js` 里 `clock` / `weather` 的 `config.city` 和 `query` 兜底值，
+以及 `host.py` 的 `/api/data/weather` 默认值（三处都已经是「北京」）。
 
 ## 编辑器
 
@@ -114,6 +139,20 @@ export default {
 - **画面由 host 侧 ffmpeg 解码**（`bgr565le` → sidecar 的 `0x04` 消息），锁屏后不受 WebView 节流影响，稳定 12 fps
 - 素材：`panel/web/media/*.mp4` + `~/Movies/cs80-screensaver/*.mp4`
 - 加自己的视频：`sh panel/add-screensaver.sh ~/Downloads/xxx.mp4 名字`（转成 800×1280 / 12 fps）
+
+## 屏闪自检
+
+设备侧“纯闪”的成因只有三类（固件重绘 / 背光 PWM / 面板与供电），`docs/troubleshooting.md#屏闪` 有完整对照表。
+客户端只做两件事帮定位：
+
+- **亮度会被记住，不会被自动改**：顶栏滑杆 / 设备上的 `+ -` 键设的值都写进
+  `~/.cs80_panel/config.json`，host 重启、设备断电重连后会**恢复成你选的值**（固件上电默认 100，
+  host 读一次状态发现不一致才下发）。想强制锁一个值：`CS80_BRIGHTNESS=100`（老行为）；
+  想完全不闪就把亮度设 100 —— `<100` 时固件走 1 kHz 软件 PWM 调光，中间灰会轻微抖。
+- **纯色自检**：侧栏「设备」卡片里的 白/灰/暗/蓝/黑 → `POST /api/device/pattern {"color":"gray"}`，
+  host 直接在 Python 里合成 800×1280 BGR565 整帧走 sidecar 的 `0x04`（跟屏保同一条路），
+  逐色看就知道是背光/供电（全闪）还是面板静态色闪（只有中间色闪）；
+  设备详情里同时显示 `背光 xx%` 与 `PWM 运行 <edges>`（`state.edges` 在涨 = PWM 没停）
 
 ## 天气数据
 

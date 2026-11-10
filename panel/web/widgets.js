@@ -635,8 +635,8 @@ export const WIDGETS = {
     label: '时钟',
     icon: '<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>',
     min: [2, 1],
-    config: { city: '上海', showWeather: true, font: 'mono' },
-    needs: { kind: 'weather', ttl: 600000, query: (cfg) => ({ city: cfg.city || '上海' }) },
+    config: { city: '北京', showWeather: true, font: 'mono' },
+    needs: { kind: 'weather', ttl: 600000, query: (cfg) => ({ city: cfg.city || '北京' }) },
     draw(ctx, r, cfg, d, t) {
       const now = new Date();
       const pad = Math.max(10, r.w * 0.034);
@@ -860,7 +860,7 @@ export const WIDGETS = {
     label: '天气',
     icon: '<path d="M5 11.5a2.5 2.5 0 0 1 .3-5 3.5 3.5 0 0 1 6.6 1A2 2 0 0 1 12 11.5"/><circle cx="5.5" cy="4.5" r="1.6"/>',
     min: [1, 1],
-    needs: { kind: 'weather', ttl: 600000, query: (cfg) => ({ city: cfg.city || '上海' }) },
+    needs: { kind: 'weather', ttl: 600000, query: (cfg) => ({ city: cfg.city || '北京' }) },
     draw(ctx, r, cfg, d, t) {
       const pad = Math.max(10, r.w * 0.06);
       const inner = card(ctx, r, t, {
@@ -1129,8 +1129,8 @@ export const WIDGETS = {
     label: '时钟 · 表盘',
     icon: '<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/><path d="M8 1.6v1M8 13.4v1M1.6 8h1M13.4 8h1"/>',
     min: [3, 2],
-    config: { city: '上海', showWeather: true, customTitle: true },
-    needs: { kind: 'weather', ttl: 600000, query: (cfg) => ({ city: cfg.city || '上海' }) },
+    config: { city: '北京', showWeather: true, customTitle: true },
+    needs: { kind: 'weather', ttl: 600000, query: (cfg) => ({ city: cfg.city || '北京' }) },
     draw(ctx, r, cfg, d, t) {
       const now = new Date();
       const pad = Math.max(8, r.w * 0.02);
@@ -1269,7 +1269,9 @@ export const WIDGETS = {
       const cpu = d && typeof d.cpu === 'number' ? Math.min(1, Math.max(0, d.cpu)) : 0;
       const mem = d && d.memTotal ? Math.min(1, Math.max(0, d.mem / d.memTotal)) : 0;
       const pad = Math.max(10, r.w * 0.04);
-      const inner = card(ctx, r, t, { title: cfg.title || 'RunCat', meta: (d && d.host) || '', pad });
+      // 右上角显示局域网 IP（拿不到就退到主机名）；cfg.meta = 'host' 可以强制显示主机名
+      const meta = cfg.meta === 'host' ? (d && d.host) : ((d && (d.ip || d.host)) || '');
+      const inner = card(ctx, r, t, { title: cfg.title || 'RunCat', meta, pad });
 
       // 底部固定留一条读数带（数字 + 网速），圆环只在上面那块里画
       const textBand = Math.max(44, inner.h * 0.26);

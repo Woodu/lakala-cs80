@@ -1,4 +1,4 @@
-# macOS / Windows
+# ---- macOS / Windows ----
 .DS_Store
 .AppleDouble
 .LSOverride
@@ -6,7 +6,7 @@ Thumbs.db
 Desktop.ini
 ehthumbs.db
 
-# Editors / IDEs
+# ---- 编辑器 / IDE ----
 .idea/
 .vscode/
 *.swp
@@ -15,39 +15,20 @@ ehthumbs.db
 .project
 .settings/
 
-# Python
+# ---- Python ----
 __pycache__/
 *.py[cod]
-*$py.class
 *.egg-info/
-.eggs/
 dist/
 build/
-*.egg
 .venv/
 venv/
 env/
-.Python
-pip-log.txt
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
 .coverage
 htmlcov/
-
-# win-flash：刷机脚本解压出的便携 Python / 临时文件
-win-flash/flash/py/
-win-flash/flash/tmp.zip
-win-flash/flash/*.tmp
-
-# 本地渲染/调试输出（默认写 ~/cs80_display，防误放仓库内）
-cs80_display/
-status.jpg
-out.jpg
-*.local.jpg
-*.local.json
-
-# 日志与本地密钥
 *.log
 .env
 .env.*
@@ -55,18 +36,34 @@ out.jpg
 *.pem
 *.key
 
-# QDisplay 上位机的自定义源放在 build/ 里，别被上面的 build/ 规则吃掉
-
-# 部署时备份的原始 DLL
-*.orig
-
-# 摄像头截图/状态文件的本地输出
-
-__pycache__/
+# ---- panel：sidecar 编译产物（按 README/docs 编译生成）----
 panel/qdc1
+panel/qdc1.exe
+panel/*.obj
+panel/*.pdb
+
+# ---- panel：Tauri 壳的依赖与构建产物 ----
 panel/shell/node_modules/
 panel/shell/src-tauri/target/
 panel/shell/src-tauri/gen/
 
-# Tauri 生成的 schema / 构建产物
-panel/shell/src-tauri/gen/
+# ---- panel：打包时临时拷入的便携 Python（来自 win-flash/flash/py）----
+panel/py/
+
+# ---- win-flash：解压出的便携 Python 与刷机临时文件 ----
+win-flash/flash/py/
+win-flash/flash/tmp.zip
+win-flash/flash/*.tmp
+
+# ---- 刷机时生成的固件变体（脚本随时可重建）----
+win-flash/flash/*.bin
+win-display/qdisplay/*_*.bin
+!win-display/qdisplay/qdisplay_native_031.bin
+
+# ---- 本地渲染/调试输出 ----
+cs80_display/
+status.jpg
+out.jpg
+*.local.jpg
+*.local.json
+*.orig

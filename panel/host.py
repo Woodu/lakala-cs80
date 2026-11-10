@@ -31,18 +31,32 @@ WEB = os.path.join(HERE, "web")
 SIDECAR = os.path.join(HERE, "qdc1.exe" if os.name == "nt" else "qdc1")
 LAYOUT = os.path.join(os.path.expanduser("~"), ".cs80_panel", "layout.json")
 STATE_FILE = os.path.join(os.path.expanduser("~"), "cs80_display", "state.json")
+CONF_DIR = os.path.join(os.path.expanduser("~"), ".cs80_panel")  # 跨平台：日志/配置都放这儿
+SIDECAR_LOG = os.path.join(CONF_DIR, "sidecar.log")
+WEB_LOG = os.path.join(CONF_DIR, "web.log")
+# 连上设备时把亮度拉回这个值（0 = 不动）。固件默认 100、PWM 全停；但 +/- 键或
+# 上位机设过的低亮度会留在固件 RAM 里，断开主机后固件自己画的等待页仍在 1 kHz 软件
+# PWM 下微闪 —— 所以每次连上都重置一次。用户在本进程里手动设过亮度就不再覆盖。
+# 亮度策略：**默认不自动设**（以前连上就拉回 100，会把用户手动调的 50% 几十秒后又刷回去）。
+# 现在改成“记住用户选的值”：见 Device._bright_state()。
+#   CS80_BRIGHTNESS=100  → 强制锁定到 100（老行为，想要 PWM 完全不停时用）
+BRIGHTNESS_PIN = int(os.environ.get("CS80_BRIGHTNESS", "0") or 0)
 
 GRID_PAGE = {
     "id": "main",
     "name": "主页",
     "type": "grid",
     "widgets": [
-        {"id": "clock", "type": "clock", "cell": [0, 0, 5, 2], "config": {}},
-        {"id": "agent", "type": "agent", "cell": [0, 2, 5, 2], "config": {}},
-        {"id": "system", "type": "system", "cell": [0, 4, 3, 2], "config": {}},
-        {"id": "weather", "type": "weather", "cell": [3, 4, 2, 2], "config": {"city": "上海"}},
-        {"id": "stock", "type": "stock", "cell": [0, 6, 2, 2], "config": {"symbol": "sh000001", "name": "上证指数"}},
-        {"id": "kline", "type": "kline", "cell": [2, 6, 3, 2], "config": {"symbol": "sh000001"}},
+        # 左上：3×2 时钟（右上角待带天气，城市 北京）
+        {"id": "clock", "type": "clock_dial", "cell": [0, 0, 3, 2],
+         "config": {"city": "北京", "showWeather": True}},
+        # 右上：2×2 RunCat
+        {"id": "runcat", "type": "runcat", "cell": [3, 0, 2, 2], "config": {}},
+        # 中间两行：5×2 自选股（新版多股组件，一行一只）
+        {"id": "stock", "type": "stock", "cell": [0, 2, 5, 2],
+         "config": {"symbols": "sz002654,sh600641", "title": "自选股"}},
+        # 剩下的 5×4 给 Agent
+        {"id": "agent", "type": "agent", "cell": [0, 4, 5, 4], "config": {}},
     ],
 }
 
@@ -101,13 +115,36 @@ def migrate_layout(layout):
 
 # ---------------- 屏保 ----------------
 SCREENSAVER_CFG = os.path.join(os.path.expanduser("~"), ".cs80_panel", "screensaver.json")
-MEDIA_DIRS = [os.path.join(HERE, "web", "media"), os.path.join(os.path.expanduser("~"), "Movies", "cs80-screensaver")]
+MEDIA_DIRS = [os.path.join(HERE, "web", "media")]
+for _d in (("Videos",) if os.name == "nt" else ("Movies",)):
+    MEDIA_DIRS.append(os.path.join(os.path.expanduser("~"), _d, "cs80-screensaver"))
+MEDIA_DIRS.append(os.path.join(os.path.expanduser("~"), "Movies", "cs80-screensaver"))  # mac 习惯目录也认
 SCREEN_STATE = {"locked": False, "asleep": False, "at": 0.0}
 SAVER = None
 
 
+def _windows_locked():
+    """Windows：锁屏/UAC 时输入桌面变成 secure desktop → OpenInputDesktop 失败。"""
+    try:
+        import ctypes
+
+        u32 = ctypes.windll.user32
+        u32.OpenInputDesktop.restype = ctypes.c_void_p
+        u32.OpenInputDesktop.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        u32.CloseDesktop.argtypes = [ctypes.c_void_p]
+        h = u32.OpenInputDesktop(0, False, 0x0100)  # DESKTOP_READOBJECTS
+        if not h:
+            return True
+        u32.CloseDesktop(h)
+        return False
+    except Exception:
+        return False
+
+
 def screen_locked():
-    """用 CGSessionCopyCurrentDictionary 读 CGSSessionScreenIsLocked（无需额外依赖）。"""
+    """锁屏判定：macOS 用 CGSessionCopyCurrentDictionary；Windows 用 OpenInputDesktop。"""
+    if os.name == "nt":
+        return _windows_locked()
     if sys.platform != "darwin":
         return False
     try:
@@ -137,6 +174,8 @@ def screen_locked():
 
 def display_asleep():
     """显示器是否休眠（拿不到就当作没睡，宁可不触发屏保）"""
+    if os.name == "nt":
+        return False  # Windows 没有便宜可靠的接口，锁屏（screen_locked）已经够用了
     try:
         out = subprocess.check_output(["pmset", "-g", "powerstate", "IODisplayWrangler"], text=True, timeout=4)
         return " 1" in out.split("\n")[-2]
@@ -193,7 +232,8 @@ class Saver:
             self.error = "找不到视频：%s" % name
             return False
         if not shutil.which("ffmpeg"):
-            self.error = "没有 ffmpeg（brew install ffmpeg）"
+            self.error = ("没有 ffmpeg（Windows: winget install Gyan.FFmpeg"
+                          if os.name == "nt" else "没有 ffmpeg（brew install ffmpeg）")
             return False
         self.stop()
         cmd = [
@@ -277,6 +317,28 @@ def screensaver_files():
     return files
 
 
+def load_config():
+    """~/.cs80_panel/config.json：目前只存亮度偏好，以后可放其它全局设置。"""
+    try:
+        with open(os.path.join(CONF_DIR, "config.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(CONF_DIR, exist_ok=True)
+        path = os.path.join(CONF_DIR, "config.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def load_saver_cfg():
     try:
         with open(SCREENSAVER_CFG, encoding="utf-8") as f:
@@ -317,6 +379,80 @@ def web_build():
 
 
 # ---------------- sidecar ----------------
+# ---------------- sidecar ----------------
+def _active_coms():
+    """HKLM\\HARDWARE\\DEVICEMAP\\SERIALCOMM：当前真正在场的串口名（COM19 之类）。"""
+    try:
+        import winreg
+    except Exception:
+        return set()
+    out = set()
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM") as k:
+            for i in range(256):
+                try:
+                    _name, val, _t = winreg.EnumValue(k, i)
+                except OSError:
+                    break
+                if isinstance(val, str) and val.upper().startswith("COM"):
+                    out.add(val.upper())
+    except OSError:
+        pass
+    return out
+
+
+def _windows_qdc1_com():
+    """Windows：QDC1 数据口是复合设备的 **MI_20** 接口（= USB interface 32）。
+
+    注册表 `Enum\\USB\\VID_2C7C&PID_0901&MI_20\\<实例>\\Device Parameters\\PortName` 里有它的口名，
+    但**拔插 / 换 USB 口之后会留下旧实例**（明明已经变成 COM22，注册表还写着 COM15）。
+    所以只认「同时出现在 SERIALCOMM（当前在场串口）里」的那个；都不匹配就返回空，
+    由 `_probe_qdc1()` 用 sidecar 的 `--probe` 真正问一遍。
+    """
+    try:
+        import winreg
+    except Exception:
+        return ""
+    active = _active_coms()
+    base = r"SYSTEM\CurrentControlSet\Enum\USB\VID_2C7C&PID_0901&MI_20"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as k:
+            for i in range(16):
+                try:
+                    inst = winreg.EnumKey(k, i)
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(k, inst + r"\Device Parameters") as dp:
+                        port = str(winreg.QueryValueEx(dp, "PortName")[0] or "")
+                except OSError:
+                    continue
+                if port and (not active or port.upper() in active):
+                    return port
+    except OSError:
+        pass
+    return ""
+
+
+def _probe_qdc1():
+    """兜底：让 sidecar 自带探针逐个 COM 发 HELLO，返回真应答的那个口。"""
+    try:
+        out = subprocess.run([SIDECAR, "--probe"], capture_output=True, text=True, timeout=120)
+    except Exception:
+        return ""
+    for line in (out.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("qdc1"):
+            return str(ev.get("com") or "")
+    return ""
+
+
 class Device:
     """独占 USB 的 sidecar 进程 + 自愈：进程死了/链路死了都自动重启并重新枚举设备。"""
 
@@ -327,15 +463,43 @@ class Device:
         self.status = {"device": "connecting"}
         self.last = None
         self.last_event = 0.0
+        self.user_brightness = None  # 本进程里用户手动设过亮度
+        self.bright_pref = load_config().get("brightness")  # 用户偏好（持久化到 ~/.cs80_panel/config.json）
+        self.bright_expect = None    # 我们刚发出去、还没确认的值
+        self.need_restore = False    # 刚(重)连上：第一条 state 用来“恢复偏好”，不拿来学习
+        self.com = ""  # Windows：QDC1 数据串口（自动从注册表识别）
         threading.Thread(target=self._supervise, daemon=True).start()
         threading.Thread(target=self._poll_state, daemon=True).start()
 
     def _spawn(self):
+        # 同时只能有一个 sidecar 持有 USB：先确认旧的已经退出，否则 Windows 上两个句柄
+        # 会同时打开同一个 CDC 口 → 回包被抢走，看起来就是“时通时不通/卡住”。
+        old = self.proc
+        if old is not None and old.poll() is None:
+            try:
+                old.kill()
+                old.wait(timeout=5)
+            except Exception:
+                pass
         self.session += 1
-        err = open("/tmp/cs80_sidecar.log", "ab")
+        os.makedirs(CONF_DIR, exist_ok=True)
+        err = open(SIDECAR_LOG, "ab")
+        cmd = [SIDECAR]
+        if os.name == "nt":
+            com = os.environ.get("CS80_COM") or self.com or _windows_qdc1_com()
+            if not com:
+                com = _probe_qdc1()
+            if not com:
+                err.close()
+                self.status = {"device": "down", "reason": "no-qdc1-port"}
+                return False
+            if com != self.com:
+                print("CS80: 自动识别 QDC1 串口 = %s" % com, flush=True)
+            self.com = com
+            cmd += ["--com", com]
         try:
             self.proc = subprocess.Popen(
-                [SIDECAR], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, bufsize=0
             )
         except FileNotFoundError:
             self.status = {"device": "no-sidecar"}
@@ -358,6 +522,13 @@ class Device:
             name = ev.get("event")
             if name == "ready":
                 self.status = dict(self.status, device="up", ready=ev)
+                if BRIGHTNESS_PIN:
+                    self.bright_expect = BRIGHTNESS_PIN
+                    self.control(1, BRIGHTNESS_PIN)   # 强制模式（CS80_BRIGHTNESS=xxx）
+                else:
+                    # 不盲设，先读一次状态：拿它决定“要不要把用户偏好恢复回去”
+                    self.need_restore = True
+                    self.control(4)
             elif name == "features":
                 self.status = dict(self.status, features=ev)
             elif name == "lost":
@@ -370,10 +541,51 @@ class Device:
                 )
             elif name in ("brightness", "power", "state"):
                 self.status = dict(self.status, **{name: {k: v for k, v in ev.items() if k != "event"}})
+                if name == "state":
+                    self._bright_state(ev.get("brightness"))
         proc.wait()
         if self.proc is proc:
             self.proc = None
             self.status = dict(self.status, device="down")
+
+    # ---- 亮度：记住用户选的值，不自己改 ----
+    def _set_bright(self, value):
+        """主动设亮度（用户操作 / 连上后恢复偏好）。记下期望值供回读确认，并持久化。"""
+        cfg = load_config()
+        self.bright_pref = value
+        self.bright_expect = value
+        if cfg.get("brightness") != value:
+            cfg["brightness"] = value
+            save_config(cfg)
+        self.control(1, value)
+
+    def _bright_state(self, cur):
+        """收到 HELLO flags=10（亮度/背光/edges）时决定要不要动亮度。
+
+        * 强制模式（`CS80_BRIGHTNESS=N`）：一直拉回 N
+        * 刚（重）连上：固件会回到默认 100 → 把用户偏好恢复回去
+        * 稳定运行中：设备上的 +/- 键改了亮度 → 以设备为准，学下来并持久化，**不跟用户抢**
+        这样“手动调到 50%”不会再几十秒后被刷回 100%，而断电重连后也能回到 50%。
+        """
+        if not isinstance(cur, int):
+            return
+        if BRIGHTNESS_PIN:
+            if cur != BRIGHTNESS_PIN:
+                self.bright_expect = BRIGHTNESS_PIN
+                self.control(1, BRIGHTNESS_PIN)
+            return
+        if self.need_restore:
+            self.need_restore = False
+            if self.bright_pref is not None and cur != self.bright_pref:
+                self._set_bright(self.bright_pref)
+            return
+        if self.bright_expect is not None:
+            self.bright_expect = None
+            if cur != self.bright_pref:
+                self._set_bright(cur)   # 设的瞬间又被按键改了 → 听用户的
+            return
+        if self.bright_pref is None or cur != self.bright_pref:
+            self._set_bright(cur)       # 首次运行 / 设备上按了 +/-：学下来
 
     def _supervise(self):
         backoff = 1.0
@@ -396,10 +608,14 @@ class Device:
                             self.proc.kill()
                         time.sleep(backoff)
                         backoff = min(backoff * 2, 5.0)
-            elif time.time() - self.last_event > 6:
-                # 进程活着但 6 秒没有任何事件（正常保活 1.5s 一条）→ 链路已死，杀掉重启
+            elif time.time() - self.last_event > 10:
+                # 进程活着但 10 秒没有任何事件（正常保活 1.5s 一条）→ 链路已死，杀掉重启
                 self.status = dict(self.status, device="down", reason="stalled")
                 proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
             time.sleep(0.5)
 
     def _poll_state(self):
@@ -748,19 +964,57 @@ def portfolio(symbols):
 # ---------- 本机 Coding Agent 会话扫描 ----------
 # 思路：会话都在本地落 jsonl（Pi / Claude Code / Codex），用文件的 mtime 当"最近活动"，
 # 用进程是否存活区分「运行中」和「等待输入」，标题取会话里第一条用户消息。
+# procs：进程名/命令行 token。macOS 上是可执行文件名；Windows 上 npm 全局装的 CLI
+# 实际跑成 node.exe + 一段带包名的命令行，所以把包名也列进来（两端通用、不会误伤）。
 AGENT_SPECS = [
-    {"id": "pi", "name": "Pi", "short": "Pi", "roots": ["~/.pi/agent/sessions"], "procs": ["pi"]},
-    {"id": "claude", "name": "Claude Code", "short": "Claude", "roots": ["~/.claude/projects"], "procs": ["claude"]},
-    {"id": "codex", "name": "Codex", "short": "Codex", "roots": ["~/.codex/sessions"], "procs": ["codex"]},
+    {"id": "pi", "name": "Pi", "short": "Pi", "roots": ["~/.pi/agent/sessions"],
+     "procs": ["pi", "pi-coding-agent"]},
+    {"id": "claude", "name": "Claude Code", "short": "Claude", "roots": ["~/.claude/projects"],
+     "procs": ["claude", "claude-code"]},
+    {"id": "codex", "name": "Codex", "short": "Codex", "roots": ["~/.codex/sessions"],
+     "procs": ["codex", "codex-cli"]},
     # DeepSeek Harness 是 Electron 应用，会话存在 IndexedDB 里，只能靠进程判断
-    {"id": "deepseek", "name": "DeepSeek Harness", "short": "DeepSeek", "roots": [], "procs": ["DeepSeek Harness"]},
+    {"id": "deepseek", "name": "DeepSeek Harness", "short": "DeepSeek", "roots": [],
+     "procs": ["DeepSeek Harness", "deepseek-harness"]},
 ]
 
 _TITLE_CACHE = {}
 
 
 def _alive_agents():
-    """一次 ps 判断哪些 agent 进程活着（按 basename 精确匹配，避免 'pi' 误伤）"""
+    """判断哪些 agent 进程活着（macOS 用 ps，Windows 用 Get-CimInstance）。"""
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.Name)`t$($_.CommandLine)\" }"],
+                capture_output=True, text=True, timeout=12)
+        except Exception:
+            return set()
+        rows = []
+        for line in (out.stdout or "").splitlines():
+            name, _, cmd = line.partition("\t")
+            name, cmd = name.strip().lower(), cmd.strip().lower()
+            if name:
+                rows.append((name, cmd))
+        alive = set()
+        for spec in AGENT_SPECS:
+            for needle in spec["procs"]:
+                n = needle.lower()
+                hit = False
+                for name, cmd in rows:
+                    if " " in n:
+                        hit = n in cmd
+                    else:
+                        # 名字精确匹配（带/不带 .exe），或者命令行的某个 token 就是它
+                        hit = (name == n or name == n + ".exe" or
+                               any(tok == n for tok in re.split(r"[\s\"'=/\\]+", cmd)))
+                    if hit:
+                        break
+                if hit:
+                    alive.add(spec["id"])
+                    break
+        return alive
     try:
         out = subprocess.check_output(["ps", "-Ao", "command="], text=True, timeout=5)
     except Exception:
@@ -780,6 +1034,35 @@ def _alive_agents():
                 alive.add(spec["id"])
                 break
     return alive
+
+
+def music():
+    """当前正在播放的音乐。macOS 走 osascript；Windows 暂不实现（WinRT 媒体会话接口较重），
+    直接返回未在播放，组件显示「未在播放」而不是报错。"""
+    if os.name == "nt":
+        return {"playing": False}
+    script = '''
+    tell application "System Events"
+      set runningApps to name of every process
+    end tell
+    if runningApps contains "Music" then
+      tell application "Music"
+        if player state is playing then
+          return (name of current track) & "\\t" & (artist of current track) & "\\t" & "Music"
+        end if
+      end tell
+    end if
+    return ""
+    '''
+    try:
+        out = subprocess.check_output(["osascript", "-e", script], text=True, timeout=5).strip()
+    except Exception:
+        return {"playing": False}
+    if not out:
+        return {"playing": False}
+    parts = out.split("\t")
+    return {"playing": True, "title": parts[0], "artist": parts[1] if len(parts) > 1 else "",
+            "app": parts[2] if len(parts) > 2 else ""}
 
 
 def _text_of(content):
@@ -942,19 +1225,28 @@ def agents():
 
 
 _NET_PREV = {"at": 0.0, "rx": 0, "tx": 0}
+_NET_WIN = {"at": 0.0, "val": None}
+_WIN_CPU = {"ticks": None, "pct": 0.0}
 
 
 def _net_counters():
     """累计收/发字节数；取不到返回 None。"""
     try:
         if os.name == "nt":
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "$s=Get-NetAdapterStatistics;($s|Measure-Object -Sum ReceivedBytes).Sum;"
-                 "($s|Measure-Object -Sum SentBytes).Sum"],
-                capture_output=True, text=True, timeout=5)
-            vals = [int(x) for x in out.stdout.split()]
-            return (vals[0], vals[1]) if len(vals) >= 2 else None
+            # 只看默认路由那个网卡（Measure-Object 求和会被虚拟网卡异常计数带飞）
+            now = time.time()
+            if now - _NET_WIN["at"] < 1.0 and _NET_WIN["val"] is not None:
+                return _NET_WIN["val"]
+            ps = ("$i=(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | "
+                  "Select-Object -First 1).ifIndex; if(!$i){exit}; "
+                  "$n=(Get-NetAdapter -InterfaceIndex $i).Name; "
+                  "$s=Get-NetAdapterStatistics -Name $n; \"$($s.ReceivedBytes) $($s.SentBytes)\"")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=8)
+            parts = (out.stdout or "").split()
+            val = (int(parts[0]), int(parts[1])) if len(parts) >= 2 else None
+            _NET_WIN.update(at=now, val=val)
+            return val
         if os.path.exists("/proc/net/dev"):
             rx = tx = 0
             with open("/proc/net/dev") as f:
@@ -1039,6 +1331,166 @@ def _mac_cpu_percent():
 
 
 
+def _windows_metrics():
+    """Windows 的 CPU/内存（GetSystemTimes + GlobalMemoryStatusEx，不装第三方包）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("lo", wintypes.DWORD), ("hi", wintypes.DWORD)]
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    k32 = ctypes.windll.kernel32
+    idle, kern, user = FILETIME(), FILETIME(), FILETIME()
+    now = time.time()
+    if not k32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+        raise OSError("GetSystemTimes failed")
+    ticks = [(x.hi << 32) | x.lo for x in (idle, kern, user)]
+    prev = _WIN_CPU["ticks"]
+    _WIN_CPU["ticks"] = ticks
+    if prev:
+        d_idle, d_kern, d_user = (a - b for a, b in zip(ticks, prev))
+        total = d_kern + d_user  # kernel 已含 idle
+        if total > 0:
+            _WIN_CPU["pct"] = max(0.0, min(1.0, 1.0 - d_idle / total))
+
+    ms = MEMORYSTATUSEX()
+    ms.dwLength = ctypes.sizeof(ms)
+    k32.GlobalMemoryStatusEx(ctypes.byref(ms))
+    total_gb = ms.ullTotalPhys / 2**30
+    used_gb = (ms.ullTotalPhys - ms.ullAvailPhys) / 2**30
+    return {
+        "cpu": round(_WIN_CPU["pct"], 3),
+        "mem": round(used_gb, 2),
+        "memTotal": round(total_gb, 1),
+        "host": os.environ.get("COMPUTERNAME", ""),
+        "load": 0,
+    }
+
+
+_IP_CACHE = {"at": 0.0, "ip": ""}
+
+
+_TUN_HINTS = ("tunnel", "tap", "tun", "vpn", "meta", "wireguard", "zerotier", "tailscale", "clash")
+
+
+def _rank_ip(ip, has_gw, desc):
+    """越小越像“真正的局域网 IP”；None = 不要。"""
+    if not ip or ip.startswith("127.") or ip.startswith("169.254.") or ip == "0.0.0.0":
+        return None
+    if ip.startswith("198.18.") or ip.startswith("198.19."):
+        return None  # 代理 TUN / 基准测试保留段（Clash、FlClash 的 Meta Tunnel 就用这个）
+    parts = ip.split(".")
+    private = (ip.startswith("10.") or ip.startswith("192.168.")
+               or (len(parts) == 4 and parts[0] == "172" and parts[1].isdigit() and 16 <= int(parts[1]) <= 31))
+    if any(h in (desc or "").lower() for h in _TUN_HINTS):
+        return 4
+    if private and has_gw:
+        return 0
+    if private:
+        return 1
+    if has_gw:
+        return 2
+    return 3
+
+
+def _lan_ip_win():
+    """Get-NetIPConfiguration → [(alias, ip, 有无默认网关, 网卡描述)]"""
+    ps = ("Get-NetIPConfiguration | ForEach-Object { "
+          "\"$($_.InterfaceAlias)`t$($_.IPv4Address.IPAddress -join ',')\t"
+          "$($_.IPv4DefaultGateway.NextHop)`t$($_.InterfaceDescription)\" }")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=10)
+    rows = []
+    for line in (out.stdout or "").splitlines():
+        cols = line.split("\t")
+        if len(cols) < 4:
+            continue
+        alias, ips, gw, desc = cols[0].strip(), cols[1].strip(), cols[2].strip(), cols[3].strip()
+        for ip in ips.split(","):
+            ip = ip.strip()
+            if ip:
+                rows.append((alias, ip, bool(gw), desc))
+    return rows
+
+
+def _lan_ip_posix():
+    """ifconfig + 默认路由 → [(iface, ip, 有无默认网关, iface)]"""
+    try:
+        conf = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=6).stdout or ""
+    except Exception:
+        return []
+    default_if = ""
+    try:
+        rn = subprocess.run(["netstat", "-rn"], capture_output=True, text=True, timeout=6).stdout or ""
+        for line in rn.splitlines():
+            cols = line.split()
+            if len(cols) >= 4 and cols[0] == "default":
+                default_if = cols[-1]
+                break
+    except Exception:
+        pass
+    rows, cur = [], ""
+    for line in conf.splitlines():
+        if line and not line.startswith(("\t", " ")):
+            cur = line.split(":")[0]
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", line)
+        if m and cur:
+            rows.append((cur, m.group(1), cur == default_if, cur))
+    return rows
+
+
+def lan_ip():
+    """本机**局域网** IPv4（拿不到就返回空字符串，绝不抛异常）。
+
+    不能简单地用“默认路由那张网卡”：开了代理（Clash/FlClash 的 Meta Tunnel）时默认路由是指向
+    TUN 的，会拿到 198.18.0.1；VMware 的 VMnet 又是 192.168.x.x。所以枚举所有 IPv4 再打分：
+
+    1. 优先「私网段 + 有默认网关」的物理网卡（WLAN / 以太网）
+    2. 其次私网但没网关的；再次有网关的公网地址
+    3. 直接丢弃：回环、169.254 链路本地、198.18/19（TUN）、以及描述里带 tunnel/vpn/meta/… 的网卡
+
+    10 秒缓存，换 WiFi / 插网线能自动跟上。
+    """
+    now = time.time()
+    if _IP_CACHE["ip"] and now - _IP_CACHE["at"] < 10:
+        return _IP_CACHE["ip"]
+    rows = []
+    try:
+        rows = _lan_ip_win() if os.name == "nt" else _lan_ip_posix()
+    except Exception:
+        rows = []
+    ranked = []
+    for _alias, ip, has_gw, desc in rows:
+        r = _rank_ip(ip, has_gw, desc)
+        if r is not None:
+            ranked.append((r, ip))
+    ip = ""
+    if ranked:
+        ip = sorted(ranked)[0][1]
+    if not ip:  # 全都不合适（例如机器上只有代理 TUN）→ 回退到“默认路由地址”
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                cand = s.getsockname()[0]
+            finally:
+                s.close()
+            if _rank_ip(cand, True, "") is not None:
+                ip = cand
+        except Exception:
+            ip = ""
+    _IP_CACHE.update(at=now, ip=ip)
+    return ip
+
+
 def system_metrics():
     if os.name == "nt":
         try:
@@ -1046,6 +1498,7 @@ def system_metrics():
         except Exception:
             m = {"cpu": 0, "mem": 0, "memTotal": 0, "host": os.environ.get("COMPUTERNAME", ""), "load": 0}
         m["netUp"], m["netDown"] = net_rates()
+        m["ip"] = lan_ip()
         return m
     if sys.platform == "darwin":
         cpu = _mac_cpu_percent()
@@ -1081,6 +1534,7 @@ def system_metrics():
         "memTotal": round(total, 1),
         "netUp": up,
         "netDown": down,
+        "ip": lan_ip(),
         "host": os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", ""),
         "load": round(os.getloadavg()[0], 2) if hasattr(os, "getloadavg") else 0,
     }
@@ -1115,6 +1569,34 @@ def save_layout(layout):
     os.replace(tmp, LAYOUT)
 
 
+# ---- 纯色测试图案（判断「屏闪」到底是背光/面板还是我们推的帧）----
+PATTERN_COLORS = {
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+    "gray": (128, 128, 128),
+    "dark": (24, 26, 32),
+    "red": (255, 0, 0),
+    "green": (0, 255, 0),
+    "blue": (0, 0, 255),
+}
+
+
+def parse_color(spec):
+    s = str(spec).strip().lower()
+    if s in PATTERN_COLORS:
+        return PATTERN_COLORS[s]
+    if len(s) == 7 and s[0] == "#":
+        return tuple(int(s[i:i + 2], 16) for i in (1, 3, 5))
+    raise ValueError(spec)
+
+
+def solid_bgr565(rgb):
+    """整屏单色 BGR565 小端整帧（2 MB）：sidecar 的 0x04 消息，不用再过一遍 RGB 转换。"""
+    r, g, b = rgb
+    value = ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3)
+    return value.to_bytes(2, "little") * (800 * 1280)
+
+
 class Handler(BaseHTTPRequestHandler):
     device = None
     protocol_version = "HTTP/1.1"
@@ -1142,9 +1624,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             return self._send(200, dict(self.device.status, session=self.device.session, layout=load_layout(),
                                        sidecar=self.device.last, build=web_build(),
-                                       screen=dict(SCREEN_STATE)))
+                                       screen=dict(SCREEN_STATE),
+                                       logs={"sidecar": SIDECAR_LOG, "web": WEB_LOG}))
         if path == "/api/data/weather":
-            city = (qs.get("city") or ["上海"])[0]
+            city = (qs.get("city") or ["北京"])[0]
             return self._send(200, CACHE.get("wx:" + city, 900, lambda: weather(city)))
         if path == "/api/data/stock":
             sym = (qs.get("symbol") or ["sh000001"])[0]
@@ -1274,6 +1757,16 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(n)
             ok = self.device.send(b"\x02" + body)
             return self._send(200, {"ok": ok})
+        if url.path == "/api/device/pattern":
+            # 把整屏刷成一种纯色：闪不闪、闪哪种颜色，就能把固件重绘 / 背光 PWM / 面板分开
+            body = json.loads(self.rfile.read(n) or b"{}")
+            spec = body.get("color") or "gray"
+            try:
+                rgb = parse_color(spec)
+            except ValueError:
+                return self._send(400, {"error": "color 需要 #RRGGBB 或 %s" % "/".join(PATTERN_COLORS)})
+            ok = self.device.send(b"\x04" + solid_bgr565(rgb))
+            return self._send(200, {"ok": ok, "color": spec})
         if url.path == "/api/pages/active":
             body = json.loads(self.rfile.read(n) or b"{}")
             layout = load_layout()
@@ -1287,7 +1780,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
         if url.path == "/api/debug":
             text = self.rfile.read(n).decode("utf-8", "replace")
-            with open("/tmp/cs80_web.log", "a", encoding="utf-8") as f:
+            os.makedirs(CONF_DIR, exist_ok=True)
+            with open(WEB_LOG, "a", encoding="utf-8") as f:
                 f.write(time.strftime("%H:%M:%S ") + text + "\n")
             return self._send(200, {"ok": True})
         if url.path == "/api/control":
@@ -1298,7 +1792,14 @@ class Handler(BaseHTTPRequestHandler):
             arg = int(body.get("value") or 0)
             if cmd == 1 and (arg < 5 or arg > 100 or arg % 5):
                 return self._send(400, {"error": "brightness 需要 5..100 且为 5 的倍数"})
-            self.device.control(cmd, arg)
+            if cmd == 1:
+                self.device.user_brightness = arg
+                if hasattr(self.device, "_set_bright"):
+                    self.device._set_bright(arg)   # 记住偏好 + 下发（不再几十秒后又刷回 100）
+                else:
+                    self.device.control(cmd, arg)
+            else:
+                self.device.control(cmd, arg)
             time.sleep(0.15)
             return self._send(200, {"ok": True, "status": self.device.status})
         return self._send(404, {"error": "not found"})
@@ -1317,11 +1818,17 @@ def main():
         _mac_cpu_percent()
         time.sleep(0.12)
         _mac_cpu_percent()
+    elif os.name == "nt":
+        _windows_metrics()
+        time.sleep(0.12)
+        _windows_metrics()
     threading.Thread(target=_screen_watch, daemon=True).start()
     device = (
         Device()
         if not args.no_device
-        else type("D", (), {"status": {}, "last": None, "send": lambda *a: False, "control": lambda *a: False})()
+        else type("D", (), {"status": {"device": "none"}, "last": None, "session": 0,
+                            "user_brightness": None, "status_note": "no-device",
+                            "send": lambda *a: False, "control": lambda *a: False})()
     )
     Handler.device = device
     global SAVER

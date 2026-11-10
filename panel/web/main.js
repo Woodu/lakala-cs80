@@ -58,13 +58,19 @@ function paintDevice(st) {
     el('#brightness-val').textContent = b;
     el('#brightness').style.setProperty('--pct', b + '%');
   }
+  const edges = st.state && st.state.edges;
+  const bits = st.features && Number(st.features.bits);
+  // 0x40 = QD_FEATURE_SCREEN_POWER：0.3.1 起才有（等待页也开始每秒重画倒计时）
+  const fw = typeof bits === 'number' ? (bits & 0x40 ? '0.3.1+' : '0.3.0') : '—';
+  const pwm = typeof edges === 'number' ? (edges ? `运行 ${edges}` : '停（100%）') : '—';
   el('#device-detail').innerHTML = up
     ? `块大小 <code>${(st.ready && st.ready.block) || '—'}</code><br>
-       特性位 <code>${st.features ? '0x' + Number(st.features.bits).toString(16) : '—'}</code><br>
+       特性位 <code>${typeof bits === 'number' ? '0x' + bits.toString(16) : '—'}</code> · 固件 <code>${fw}</code><br>
+       背光 <code>${typeof b === 'number' ? b + '%' : '—'}</code> · PWM <code>${pwm}</code><br>
        session <code>${st.session ?? '—'}</code> · 最近事件 <code>${side.event || '—'}</code>
        ${side.wire ? ` · ${side.wire} B` : ''}`
-    : `未连上设备${st.reason ? '（' + st.reason + '）' : ''}<br>检查 Type-C 数据线 / 供电，或点设备标签重连。<br>
-       日志 <code>/tmp/cs80_sidecar.log</code>`;
+    : `未连上设备${st.reason ? '（' + st.reason + '）' : ''}<br>检查 Type-C 数据线 / 供电 / 官方上位机是否占着串口。<br>
+       日志 <code>${(st.logs && st.logs.sidecar) || '~/.cs80_panel/sidecar.log'}</code>`;
 
   // sidecar 重连（device 重启/拔插）后设备丢了帧状态 → 整帧重推
   if (pusher.session !== null && st.session !== pusher.session) {
@@ -113,6 +119,21 @@ async function boot() {
     }
     toast(paused ? '已暂停推帧（屏上定格）' : '已恢复推送');
   };
+  // 纯色自检：整屏刷一种颜色，用来看屏自身的闪（背光 PWM / 面板 / 固件重绘）
+  // 先把推送暂停，否则下一次 tick 会立刻把纯色盖回去
+  for (const btn of document.querySelectorAll('#diag-colors button')) {
+    btn.onclick = async () => {
+      const color = btn.dataset.color;
+      if (!pusher.paused) el('#btn-pause').click();
+      try {
+        await postJson('/api/device/pattern', { color });
+        pusher.markFull();
+        toast(`屏上已刷纯色：${btn.textContent}（看完点「继续推送」恢复画面）`);
+      } catch (e) {
+        toast('纯色自检失败：' + e.message, 'warn');
+      }
+    };
+  }
   el('#device-pill').onclick = async () => {
     await postJson('/api/device/reconnect', {});
     toast('正在重连设备…');

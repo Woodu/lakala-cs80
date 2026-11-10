@@ -297,7 +297,17 @@ static int raw_write(link_t *l, const void *buf, uint32_t len) {
 
 static int raw_read(link_t *l, void *buf, uint32_t *len, int timeout_ms) {
   DWORD got = 0;
-  (void)timeout_ms;
+  /* 基本功：Windows 的 CDC 读默认按 DCB 超时（2 s），会把 wait_ack 的 400ms 变成
+   * 2 s × tries；这里每次按调用方的 timeout 设一次，保证 ACK/保活能按预期快失败。 */
+  COMMTIMEOUTS to;
+  memset(&to, 0, sizeof to);
+  /* ReadIntervalTimeout 非 0 才是关键：数据流出现 10ms 间歇就立刻返回（ACK 是整包来的），
+   * 总超时仍按调用方的 timeout 兜底。如果设成 0，ReadFile 会一直等到读满 128 字节或总超时，
+   * 每条 ACK 都要白等 400ms。 */
+  to.ReadIntervalTimeout = 10;
+  to.ReadTotalTimeoutMultiplier = 0;
+  to.ReadTotalTimeoutConstant = (DWORD)(timeout_ms > 0 ? timeout_ms : 1);
+  SetCommTimeouts(l->port, &to);
   if (!ReadFile(l->port, buf, *len, &got, NULL)) return -1;
   *len = got;
   return got ? 0 : -1;
@@ -326,27 +336,54 @@ static int send_cmd(link_t *l, uint8_t kind, uint16_t flags, uint32_t offset, ui
   return raw_write(l, h, 32 + len);
 }
 
+static uint32_t reply_body[6];
+
 static void link_lost(const char *reason) {
-  fprintf(stderr, "cs80: 链路丢失 (%s)，退出等 host 重新枚举设备\n", reason);
+  /* 带上固件回的状态码：0=OK（说明只是我们没等到）1..8 见 docs/protocol.md，
+   * 其中 8 = 设备接收超时（数据没在 3 s 内收全，常见于内容太大被丢弃）。 */
+  fprintf(stderr, "cs80: 链路丢失 (%s, status=%u)\n", reason, reply_body[0]);
   json("{\"event\":\"lost\",\"reason\":\"%s\"}", reason);
   if (g_link) close_link(g_link);
   exit(3);
 }
 
-static uint32_t reply_body[6];
 static int wait_ack(link_t *l, uint32_t seq, int tries) {
-  uint8_t buf[128];
+  /* 按字节流累积再切包：串口读到的不一定恰好是一条 56 字节的 ACK（可能被拆成
+   * 32+24）。以前“读到不够 56 就丢掉”会把拆开的 ACK 丢光 → 整帧 DATA 永远等不到
+   * ACK（表现为 no-ack-data，设备停在等待页）。现在累积到缓冲区里逐字节找完整帧。 */
+  static uint8_t acc[1024];
+  static size_t have;
+  have = 0;
+  uint8_t buf[256];
   for (int i = 0; i < tries && !stop; i++) {
     uint32_t len = sizeof buf;
-    if (raw_read(l, buf, &len, 400)) continue;
-    if (len < 56 || rd32(buf) != MAGIC || buf[5] != QD_ACK || rd32(buf + 28) != xxh32(buf, 28)) continue;
-    if (rd32(buf + 8) != seq) continue;
-    for (int k = 0; k < 6; k++) reply_body[k] = rd32(buf + 32 + 4 * k);
-    return 0;
+    if (raw_read(l, buf, &len, 400) == 0 && len) {
+      if (have + len > sizeof acc) have = 0;  /* 异常数据，重来 */
+      memcpy(acc + have, buf, len);
+      have += len;
+    }
+    size_t off = 0;
+    while (have - off >= 56) {
+      uint8_t *p = acc + off;
+      if (rd32(p) == MAGIC && p[5] == QD_ACK && rd32(p + 28) == xxh32(p, 28)) {
+        if (rd32(p + 8) == seq) {
+          for (int k = 0; k < 6; k++) reply_body[k] = rd32(p + 32 + 4 * k);
+          have = 0;
+          return 0;
+        }
+        off += 56;
+        continue;
+      }
+      off += 1; /* 不对齐/不是 ACK：滑动一字节重新对齐 */
+    }
+    if (off) {
+      have -= off;
+      memmove(acc, acc + off, have);
+    }
   }
+  have = 0;
   return -1;
 }
-
 /* ---------- 帧状态：本地影子 framebuffer，用于算 patch 的 base/target 哈希 ---------- */
 static uint16_t *fbuf;
 static uint32_t fbuf_hash;
@@ -359,28 +396,40 @@ static void rgb_to_bgr565(const uint8_t *rgb, uint16_t *out) {
   }
 }
 
-/* 整帧：BEGIN + 一个 LZ4 整块 DATA + COMMIT(flags=1 允许后续 patch) */
+/* 整帧：BEGIN + 每 512 KB 一块 LZ4 的 DATA + COMMIT(flags=1 允许后续 patch)
+ *
+ * 为什么不发“一个整帧 LZ4 块”：固件 `valid_header()` 要求 `h->length <= QD_BLOCK_BYTES(512000)`，
+ * 压缩后超过 512 KB 的整帧会被**静默丢弃**（没有任何 ACK）→ 主机侧看起来就是
+ * `no-ack-data` + 屏停在等待页（内容丰富/带走势图的画面很容易爆这个上限）。
+ * 改成按块压缩：每块 raw=512000（= QD_BLOCK_BYTES 上限）、codec=LZ4，固件逐块解到
+ * framebuffer 对应偏移，既不会超限，单包也更小、更好重试。
+ */
 static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
   static char *comp;
   static int cap;
   if (!cap) {
-    cap = LZ4_compressBound(FRAME_BYTES);
+    cap = LZ4_compressBound(BLOCK_BYTES);
     comp = malloc(cap);
     if (!comp) return -1;
   }
   double t0 = now_ms();
   uint32_t h = xxh32(fbuf, FRAME_BYTES);
-  int clen = LZ4_compress_default((const char *)fbuf, comp, FRAME_BYTES, cap);
-  if (clen <= 0) return -2;
   if (send_cmd(l, QD_BEGIN, 0, 0, FRAME_BYTES, NULL, 0)) link_lost("write-begin");
   if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) link_lost("no-ack-begin");
-  if (send_cmd(l, QD_DATA, 1, 0, FRAME_BYTES, comp, (uint32_t)clen)) link_lost("write-data");
-  if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) link_lost("no-ack-data");
+  uint32_t sent = 64;
+  for (uint32_t off = 0; off < FRAME_BYTES; off += BLOCK_BYTES) {
+    uint32_t n = FRAME_BYTES - off < BLOCK_BYTES ? FRAME_BYTES - off : BLOCK_BYTES;
+    int clen = LZ4_compress_default((const char *)fbuf + off, comp, (int)n, cap);
+    if (clen <= 0) return -2;
+    if (send_cmd(l, QD_DATA, 1, off, n, comp, (uint32_t)clen)) link_lost("write-data");
+    if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) link_lost("no-ack-data");
+    sent += (uint32_t)clen + 32;
+  }
   if (send_cmd(l, QD_COMMIT, 1, h, 0, NULL, 0)) link_lost("write-commit");
   if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) link_lost("no-ack-commit");
   fbuf_hash = h;
   fbuf_valid = 1;
-  *wire = (uint32_t)clen + 96;
+  *wire = sent + 32;
   *ms = (uint32_t)(now_ms() - t0);
   return 0;
 }
@@ -440,7 +489,9 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
 static int read_exact(void *buf, size_t len) {
   uint8_t *p = buf;
   while (len) {
-    ssize_t n = read(0, p, len);
+    /* Windows 的 _read 返回 int、POSIX 的 read 返回 ssize_t；
+       这里单次长度最大是一帧 2 MB，用 int 接两边都能编。 */
+    int n = (int)read(0, p, (unsigned)len);
     if (n <= 0) return -1;
     p += n;
     len -= (size_t)n;
@@ -479,7 +530,7 @@ int main(int argc, char **argv) {
       if (open_link(&t, iface)) continue;
       reply_body[0] = reply_body[5] = 0;
       send_cmd(&t, QD_HELLO, 0, 0, 0, NULL, 0);
-      int ok = !wait_ack(&t, t.seq, 10) && reply_body[0] == 0;
+      int ok = !wait_ack(&t, t.seq, 3) && reply_body[0] == 0;
       printf("{\"com\":\"%s\",\"qdc1\":%s,\"block\":%u}\n", name, ok ? "true" : "false", ok ? reply_body[5] : 0);
       if (ok) { hits++; fprintf(stderr, "cs80: QDC1 在 %s（设 CS80_COM=%s 即可）\n", name, name); }
       close_link(&t);
@@ -510,10 +561,10 @@ int main(int argc, char **argv) {
 
   /* 握手；老固件/新固件都只是给个块大小与特性位 */
   send_cmd(&l, QD_HELLO, 0, 0, 0, NULL, 0);
-  wait_ack(&l, l.seq, 40);
+  wait_ack(&l, l.seq, 20);
   json("{\"event\":\"ready\",\"block\":%u,\"status\":%u}", reply_body[5], reply_body[0]);
   send_cmd(&l, QD_HELLO, 2, 0, 0, NULL, 0);
-  if (!wait_ack(&l, l.seq, 40)) json("{\"event\":\"features\",\"bits\":%u}", reply_body[5]);
+  if (!wait_ack(&l, l.seq, 20)) json("{\"event\":\"features\",\"bits\":%u}", reply_body[5]);
 
   while (!stop) {
     if (!wait_stdin(1500)) {
