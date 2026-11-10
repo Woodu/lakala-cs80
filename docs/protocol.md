@@ -89,6 +89,11 @@ PA 使能（QL GPIO22）由固件渲染任务按「播放请求 + speaker 路由
 上传流程：`7/3` → 循环 `type=8`（每块 ≤16384 B，等 ACK，`detail`=累计字节）→ `7/4` →
 可选 `7/6` 核对 → `7/5` 播放。音频与显示共用同一条命令流，**必须串行**（本仓由 sidecar 单线程读 stdin 保证）。
 
+固件只解 **MP3**（44.1 kHz / 22.05 kHz、单双声道实测都能播）。WAV/FLAC/M4A/OGG/AAC/WMA/视频音轨
+一律在主机侧用 ffmpeg 转成 128 kbps MP3 再上传（`host.py` 的 `audio_to_mp3()`），转完仍受 4 MiB 上限约束。
+`7/5` 回 `status=4 BAD_STATE` 多半是音频路由被复位（`7/8` 诊断的 `receive`=路由，0=speaker），
+先 `7/9 offset=0` 改回 speaker、音量为 0 就补一条 `7/2`，再重试播放即可（`Device.play_uploaded()` 已内置）。
+
 ## 5. sidecar（`panel/qdc1.c`）stdin 协议
 
 上位机和 USB 之间由这个 C 程序隔开，它独占设备，因此**任何时候只能有一个进程持有 USB**。
