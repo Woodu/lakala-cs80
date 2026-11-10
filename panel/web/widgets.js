@@ -103,8 +103,126 @@ function bar(ctx, x, y, w, h, frac, color, t) {
   ctx.fill();
 }
 
+/** 虚线（列表分隔用） */
+function dashed(ctx, x1, y1, x2, y2, color = 'rgba(255,255,255,0.14)') {
+  ctx.save();
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1 + 0.5);
+  ctx.lineTo(x2, y2 + 0.5);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** 大数字 + 小字后缀（假期倒计时用）；align 决定 x 是左边界/中心/右边界 */
+function bigDays(ctx, x, y, maxW, size, n, t, align = 'right', suffix = '天') {
+  const num = String(n);
+  let s = size;
+  const widthOf = () => {
+    ctx.font = font(s, 700);
+    const nw = ctx.measureText(num).width;
+    if (!suffix) return nw;
+    ctx.font = font(s * 0.42, 500);
+    return nw + s * 0.1 + ctx.measureText(suffix).width;
+  };
+  while (widthOf() > maxW && s > 9) s *= 0.93;
+  ctx.font = font(s, 700);
+  const nw = ctx.measureText(num).width;
+  const gap = suffix ? s * 0.1 : 0;
+  ctx.font = font(s * 0.42, 500);
+  const sw = suffix ? ctx.measureText(suffix).width : 0;
+  const total = nw + gap + sw;
+  const nx = align === 'center' ? x - total / 2 : align === 'left' ? x : x - total;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = font(s, 700);
+  ctx.fillStyle = t.fg;
+  ctx.fillText(num, nx, y);
+  if (suffix) {
+    ctx.font = font(s * 0.42, 500);
+    ctx.fillStyle = t.fg3;
+    ctx.fillText(suffix, nx + nw + gap, y);
+  }
+}
+
+const mdText = (iso) => {
+  const [, m, d] = String(iso).split('-');
+  return `${Number(m)}.${Number(d)}`;
+};
+const dateRange = (it) => (it.start === it.end ? mdText(it.start) : `${mdText(it.start)}–${mdText(it.end)}`);
+
+/** 假期组件的一行：左名称/日期，右侧「还差几天」 */
+function holidayRow(ctx, x, y, w, h, it, t) {
+  const v = it.ongoing ? it.left : it.until;
+  const cy = y + h / 2;
+  const numSize = Math.min(h * 0.5, 48);
+  const suffix = w >= 200 ? '天' : ''; // 特别窄的格子省掉「天」，把宽度留给名称/日期
+  // 先算出右边数字块占多宽，左边「名称 + 日期」按剩下宽度自适应
+  ctx.font = font(numSize * 0.42, 500);
+  const numW = (suffix ? ctx.measureText(suffix).width + numSize * 0.1 : 0);
+  ctx.font = font(numSize, 700);
+  const avail = w - (numW + ctx.measureText(String(v)).width) - h * 0.16;
+
+  const range = dateRange(it);
+  const nameSize = Math.max(13, Math.min(h * 0.4, 34));
+  const gap = () => nameSize * 0.45;
+  const widthOf = (ns) => {
+    ctx.font = font(ns, 500);
+    const nw = ctx.measureText(it.name).width;
+    ctx.font = font(ns * 0.72, 400);
+    return nw + ns * 0.45 + ctx.measureText(range).width;
+  };
+  let ns = nameSize;
+  while (widthOf(ns) > avail && ns > 13) ns *= 0.94;
+  const withDate = widthOf(ns) <= avail; // 太窄就只留名称，不硬塞
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.font = font(ns, 500);
+  ctx.fillStyle = t.fg2;
+  ctx.fillText(it.name, x, cy);
+  if (withDate) {
+    const nw = ctx.measureText(it.name).width;
+    ctx.font = font(ns * 0.72, 400);
+    ctx.fillStyle = t.fg3;
+    ctx.fillText(range, x + nw + gap(), cy);
+  }
+
+  bigDays(ctx, x + w, cy + Math.min(h * 0.19, 18), w * 0.58, numSize, v, t, 'right', suffix);
+}
+
 const pctColor = (v, t) => (v >= 0 ? t.up : t.down);
 const signed = (v, digits = 2) => `${v >= 0 ? '+' : ''}${Number(v).toFixed(digits)}`;
+
+/**
+ * 列表布局：行高按内容定（不随高度压缩），高度不够就少显示几条。
+ * baseRowH 是「一行该多高」，只由宽度/字号决定；只有一行都放不下时才允许缩。
+ */
+function rowsFor(innerH, baseRowH, count) {
+  const rows = Math.max(1, Math.min(count || 1, Math.floor(innerH / baseRowH)));
+  return { rows, rowH: Math.min(baseRowH, innerH / rows) };
+}
+
+/** A 股交易时段（周一–周五 9:30–11:30 / 13:00–15:00）；休盘就不必再轮询 */
+export function tradingHours() {
+  const d = new Date();
+  const day = d.getDay();
+  if (day === 0 || day === 6) return false;
+  const m = d.getHours() * 60 + d.getMinutes();
+  return (m >= 570 && m <= 690) || (m >= 780 && m <= 900);
+}
+
+/** 小字：数据新鲜度。旧数据 → 「更新失败·重取中」，正常 → 「12:31 更新」 */
+export function freshStamp(d) {
+  if (!d || !d.fetchedAt) return null;
+  if (d.stale) return { text: '更新失败·重取中', color: '#fabe46' };
+  const at = new Date(d.fetchedAt);
+  const hm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+  const today = at.toDateString() === new Date().toDateString();
+  return { text: today ? `${hm} 更新` : `${at.getMonth() + 1}/${at.getDate()} ${hm}`, color: '' };
+}
 
 function ago(iso) {
   const mins = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
@@ -569,49 +687,31 @@ export const sevenSegWidth = (text, h, opts = {}) => {
   return total - gap;
 };
 
-// ---------------- 圆角矩形周长取样（表盘刻度用） ----------------
-function rrPerimeterPoint(x, y, w, h, rad, t) {
-  const r = Math.min(rad, w / 2 - 1, h / 2 - 1);
-  const sx = w - 2 * r;
-  const sy = h - 2 * r;
-  const arc = (Math.PI * r) / 2;
-  const perim = 2 * sx + 2 * sy + 4 * arc;
-  let d = ((t % 1) + 1) % 1 * perim;
-  const straight = (px, py, nx, ny) => ({ px, py, nx, ny });
-  // 上边：左→右
-  if (d <= sx) return straight(x + r + d, y, 0, -1);
-  d -= sx;
-  // 右上圆角
-  let a0 = -Math.PI / 2;
-  if (d <= arc) {
-    const a = a0 + d / r;
-    return straight(x + w - r + Math.cos(a) * r, y + r + Math.sin(a) * r, Math.cos(a), Math.sin(a));
+/**
+ * 射线起点相对矩形中心偏移 (ox,oy)、方向 ang，取到圆角矩形边界的距离（二分）。
+ * 表盘刻度用它落点：12 点正上方、3 点正右、6 点正下、9 点正左，而不是沿周长等距。
+ */
+function rrEdgeDistance(ox, oy, ang, w, h, r) {
+  const hw = w / 2;
+  const hh = h / 2;
+  const cos = Math.cos(ang);
+  const sin = Math.sin(ang);
+  const inside = (d) => {
+    const x = Math.abs(ox + cos * d);
+    const y = Math.abs(oy + sin * d);
+    if (x > hw || y > hh) return false;
+    const dx = Math.max(x - (hw - r), 0);
+    const dy = Math.max(y - (hh - r), 0);
+    return dx * dx + dy * dy <= r * r;
+  };
+  let lo = 0;
+  let hi = Math.hypot(w, h);
+  for (let i = 0; i < 28; i++) {
+    const mid = (lo + hi) / 2;
+    if (inside(mid)) lo = mid;
+    else hi = mid;
   }
-  d -= arc;
-  // 右边：上→下
-  if (d <= sy) return straight(x + w, y + r + d, 1, 0);
-  d -= sy;
-  a0 = 0;
-  if (d <= arc) {
-    const a = a0 + d / r;
-    return straight(x + w - r + Math.cos(a) * r, y + h - r + Math.sin(a) * r, Math.cos(a), Math.sin(a));
-  }
-  d -= arc;
-  // 下边：右→左
-  if (d <= sx) return straight(x + w - r - d, y + h, 0, 1);
-  d -= sx;
-  a0 = Math.PI / 2;
-  if (d <= arc) {
-    const a = a0 + d / r;
-    return straight(x + r + Math.cos(a) * r, y + h - r + Math.sin(a) * r, Math.cos(a), Math.sin(a));
-  }
-  d -= arc;
-  // 左边：下→上
-  if (d <= sy) return straight(x, y + h - r - d, -1, 0);
-  d -= sy;
-  a0 = Math.PI;
-  const a = a0 + d / r;
-  return straight(x + r + Math.cos(a) * r, y + r + Math.sin(a) * r, Math.cos(a), Math.sin(a));
+  return lo;
 }
 
 /** WMO code → 中文天气词 */
@@ -763,8 +863,8 @@ export const WIDGETS = {
         return `${Math.round(secs / 86400)}d`;
       };
 
-      const rowH = Math.max(34, Math.min(96, inner.h / Math.min(items.length, 9)));
-      const rows = Math.min(items.length, Math.max(1, Math.floor(inner.h / rowH)));
+      const row0 = Math.max(40, Math.min(inner.w * 0.085, 96));
+      const { rows, rowH } = rowsFor(inner.h, row0, items.length);
       const logo = Math.max(16, Math.min(rowH * 0.62, 34));
       const dot = Math.max(5, Math.min(10, rowH * 0.16));
       const chipW = Math.max(52, rowH * 1.5);
@@ -896,12 +996,14 @@ export const WIDGETS = {
     icon: '<path d="M2.5 11.5l3.5-3.5 2.5 2 4-4.5"/><path d="M10 5.5h3v3"/>',
     min: [2, 1],
     config: { symbols: 'sh000001' },
-    needs: { kind: 'portfolio', ttl: 15000, query: (cfg) => ({ symbols: cfg.symbols || cfg.symbol || 'sh000001' }) },
+    needs: { kind: 'portfolio', ttl: 15000, when: tradingHours, query: (cfg) => ({ symbols: cfg.symbols || cfg.symbol || 'sh000001' }) },
     draw(ctx, r, cfg, d, t) {
       const pad = Math.max(8, r.w * 0.025);
+      const stamp = freshStamp(d);
       const inner = card(ctx, r, t, {
         title: cfg.title || '股票',
-        meta: d && d.items ? `${d.items.length} 只` : '',
+        meta: stamp ? stamp.text : '',
+        metaColor: stamp ? stamp.color : '',
         pad,
       });
       const items = (d && d.items) || [];
@@ -913,11 +1015,13 @@ export const WIDGETS = {
         ctx.fillText(d && d.error ? '暂无数据' : '加载中…', inner.x, inner.y);
         return;
       }
-      // 一行一只股票：按高度决定显示几只
-      const minRowH = 118;
-      const rows = Math.max(1, Math.min(items.length, Math.floor(inner.h / minRowH) || 1));
+      // 一行一只股票：一格高 = 一只（2 行就 2 只），高度不够时才减条不压内容
+      const CELLH = 160; // 与 core.js 的 CELL 一致：一格 160 设备像素
       const gap = Math.max(4, inner.h * 0.02);
-      const rowH = (inner.h - gap * (rows - 1)) / rows;
+      const fit = Math.floor((inner.h + gap) / (96 + gap)); // 96 = 一行股票的最小高度
+      const perCell = Math.max(1, Math.round(r.h / CELLH));
+      const rows = Math.max(1, Math.min(items.length, fit, perCell));
+      const rowH = Math.min(200, (inner.h - gap * (rows - 1)) / rows);
       for (let i = 0; i < rows; i++) {
         stockRow(ctx, { x: inner.x, y: inner.y + i * (rowH + gap), w: inner.w, h: rowH }, items[i], t, {
           card: false,
@@ -930,7 +1034,7 @@ export const WIDGETS = {
     label: 'K 线',
     icon: '<path d="M4 3v10M4 6h3M4 9h3M10 4v9M10 6h3M10 10h3"/>',
     min: [2, 1],
-    needs: { kind: 'kline', ttl: 120000, query: (cfg) => ({ symbol: cfg.symbol || 'sh000001' }) },
+    needs: { kind: 'kline', ttl: 120000, when: tradingHours, query: (cfg) => ({ symbol: cfg.symbol || 'sh000001' }) },
     draw(ctx, r, cfg, d, t) {
       const pad = Math.max(10, r.w * 0.03);
       const inner = card(ctx, r, t, {
@@ -991,9 +1095,8 @@ export const WIDGETS = {
         ctx.fillText(d && d.error ? '暂无数据' : '加载中…', inner.x, inner.y);
         return;
       }
-      const rows = d.coins.slice(0, Math.max(1, Math.min(4, Math.floor(inner.h / 34))));
-      const rowH = inner.h / rows.length;
-      rows.forEach((c, i) => {
+      const { rows, rowH } = rowsFor(inner.h, Math.max(34, Math.min(inner.w * 0.055, 56)), d.coins.length);
+      d.coins.slice(0, rows).forEach((c, i) => {
         const yy = inner.y + i * rowH + rowH * 0.12;
         const price = Number(c.price);
         ctx.textBaseline = 'top';
@@ -1141,30 +1244,40 @@ export const WIDGETS = {
       const cx = box.x + box.w / 2;
       const cy = box.y + box.h * (showTitle ? 0.56 : 0.52);
 
-      // 刻度：像真表盘一样「按角度」均匀分布（每 6° 一根），落点贴着圆角矩形边界，方向朝圆心
+      // 刻度：每 6° 一根，沿「圆心 → 边界」的射线落点，所以 12/3/6/9 正好在上/右/下/左正中
       const inset = Math.min(box.w, box.h) * 0.028;
       const tickBase = Math.min(box.w, box.h);
-      const cornerR = Math.min(box.h * 0.1, box.w / 2 - inset, box.h / 2 - inset);
+      const gw = box.w - inset * 2;
+      const gh = box.h - inset * 2;
+      const cornerR = Math.min(box.h * 0.1, gw / 2, gh / 2);
+      // 刻度圈的矩形是 box 居中，表盘中心 cy 可能因为标题下移，射线起点按偏移算
+      const ox = cx - (box.x + box.w / 2);
+      const oy = cy - (box.y + box.h / 2);
       ctx.save();
       ctx.lineCap = 'round';
       for (let i = 0; i < 60; i++) {
         const major = i % 5 === 0;
-        // 位置：沿圆角矩形周长等距（和参考图一致）；方向：指向圆心
-        const p = rrPerimeterPoint(box.x + inset, box.y + inset, box.w - inset * 2, box.h - inset * 2, cornerR, i / 60);
-        let dx = cx - p.px;
-        let dy = cy - p.py;
-        const d = Math.hypot(dx, dy) || 1;
-        dx /= d;
-        dy /= d;
+        const ang = (i / 60) * Math.PI * 2 - Math.PI / 2; // 0° = 12 点
+        const edge = rrEdgeDistance(ox, oy, ang, gw, gh, cornerR);
+        const ux = Math.cos(ang);
+        const uy = Math.sin(ang);
+        const px = cx + ux * edge;
+        const py = cy + uy * edge;
         const len = tickBase * (major ? 0.075 : 0.04);
         ctx.strokeStyle = major ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.26)';
         ctx.lineWidth = Math.max(1.2, tickBase * (major ? 0.01 : 0.0045));
         ctx.beginPath();
-        ctx.moveTo(p.px, p.py);
-        ctx.lineTo(p.px + dx * len, p.py + dy * len);
+        ctx.moveTo(px, py);
+        ctx.lineTo(px - ux * len, py - uy * len); // 朝圆心
         ctx.stroke();
       }
       ctx.restore();
+
+      // HH : MM（中间留指针位）
+      const hh = String(now.getHours()).padStart(2, '0');
+      const mm = String(now.getMinutes()).padStart(2, '0');
+      const numSize = Math.min(box.h * 0.36, box.w * 0.19);
+      const handGap = numSize * 0.62;
 
       // 日期 + 星期（星期用 accent）
       const dateSize = Math.max(11, Math.min(box.h * 0.11, 26));
@@ -1181,14 +1294,10 @@ export const WIDGETS = {
       ctx.fillStyle = t.accent;
       ctx.fillText(weekday, cx - dW / 2 + ctx.measureText(dateTxt).width + dGap, dY);
 
-      // HH : MM（中间留指针位）
-      const hh = String(now.getHours()).padStart(2, '0');
-      const mm = String(now.getMinutes()).padStart(2, '0');
-      const numSize = Math.min(box.h * 0.36, box.w * 0.19);
-      const handGap = numSize * 0.62;
 
-      // 指针（先画，数字盖在上面）：长度按卡片宽度取，接近参考图的比例
-      const handLen = Math.min(box.w * 0.2, box.h * 0.26);
+      // 指针（先画，数字盖在上面）：分针比时针长出一截，秒针最长，长度按卡片取固定比例
+      const minLen = Math.min(box.w * 0.26, box.h * 0.33);
+      const hourLen = minLen * 0.58;
       const toRad = (deg) => ((deg - 90) * Math.PI) / 180;
       const hourAng = toRad(((now.getHours() % 12) + now.getMinutes() / 60) * 30);
       const minAng = toRad(now.getMinutes() * 6);
@@ -1198,8 +1307,8 @@ export const WIDGETS = {
       ctx.lineCap = 'round';
       ctx.lineWidth = thick;
       [
-        [hourAng, handLen * 0.8],
-        [minAng, handLen],
+        [hourAng, hourLen],
+        [minAng, minLen],
       ].forEach(([a, len]) => {
         ctx.beginPath();
         ctx.moveTo(cx - Math.cos(a) * len * 0.18, cy - Math.sin(a) * len * 0.18);
@@ -1209,7 +1318,7 @@ export const WIDGETS = {
       // 秒针：一根细长的 accent 线，横贯中心
       ctx.strokeStyle = t.accent;
       ctx.lineWidth = Math.max(1.4, thick * 0.32);
-      const secLen = Math.min(box.w * 0.34, box.h * 0.34); // 别戳到日期/天气行
+      const secLen = Math.min(box.w * 0.42, box.h * 0.42);
       ctx.beginPath();
       ctx.moveTo(cx - Math.cos(secAng) * secLen * 0.18, cy - Math.sin(secAng) * secLen * 0.18);
       ctx.lineTo(cx + Math.cos(secAng) * secLen, cy + Math.sin(secAng) * secLen);
@@ -1238,6 +1347,7 @@ export const WIDGETS = {
       ctx.beginPath();
       ctx.arc(cx, cy, thick * 0.45, 0, Math.PI * 2);
       ctx.fill();
+
 
       // 底部：天气图标 + 晴 4°
       if (cfg.showWeather !== false && d && d.temp != null) {
@@ -1369,7 +1479,216 @@ export const WIDGETS = {
       });
     },
   },
+
+  // 热榜资讯：顶部 Tab = 数据源（用户勾选哪几个就轮播哪几个），行数由组件高度决定
+  news: {
+    label: '资讯',
+    icon: '<path d="M3 3.5h10v9H3z"/><path d="M5 6h6M5 8.5h5M5 11h3"/>',
+    min: [3, 2],
+    config: { sources: ['toutiao', 'baidu', 'zhihu', 'weibo'], rotate: 60 },
+    needs: { kind: 'news', ttl: 180000, query: (cfg) => ({ sources: newsSources(cfg).join(',') }) },
+    draw(ctx, r, cfg, d, t) {
+      const pad = Math.max(10, r.w * 0.028);
+      const inner = card(ctx, r, t, { pad });
+      const ids = newsSources(cfg);
+      const hint = (txt) => {
+        ctx.fillStyle = t.fg4;
+        ctx.font = font(Math.max(13, Math.min(inner.h * 0.09, 20)), 400);
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillText(txt, inner.x, inner.y + inner.h * 0.44);
+      };
+      if (!ids.length) return hint('未选择数据源');
+
+      // Tab 条：太宽就缩字体，再宽就把放不下的 Tab 截掉（不换行、不滚动）
+      let tabFont = Math.max(13, Math.min(inner.h * 0.1, inner.w * 0.034, 24));
+      const stripW = () => {
+        ctx.font = font(tabFont, 500);
+        return ids.reduce((s, id) => s + ctx.measureText(NEWS_LABEL[id]).width + tabFont * 1.5, 0);
+      };
+      while (stripW() > inner.w && tabFont > 11) tabFont *= 0.94;
+      const tabH = tabFont * 1.9;
+      const active = Math.floor(Date.now() / (Math.max(5, Number(cfg.rotate) || 60) * 1000)) % ids.length;
+      ctx.textBaseline = 'middle';
+      let tx = inner.x;
+      ids.forEach((id, i) => {
+        ctx.font = font(tabFont, 500);
+        const w = ctx.measureText(NEWS_LABEL[id]).width + tabFont * 1.2;
+        if (tx + w > inner.x + inner.w + 1) return;
+        if (i === active) {
+          roundRect(ctx, tx, inner.y, w, tabH, tabH * 0.28);
+          ctx.fillStyle = 'rgba(255,255,255,0.10)';
+          ctx.fill();
+          ctx.fillStyle = t.fg;
+        } else {
+          ctx.fillStyle = t.fg3;
+        }
+        ctx.textAlign = 'center';
+        ctx.fillText(NEWS_LABEL[id], tx + w / 2, inner.y + tabH / 2 + 0.5);
+        tx += w + tabFont * 0.3;
+      });
+
+      const items = (d && d[ids[active]]) || [];
+      // 右上角小字：更新时间（拉取失败时变成提示，数据仍然是旧的）
+      const stamp = d && d.stale ? { text: '更新失败·重取中', color: '#fabe46' } : freshStamp(d);
+      if (stamp) {
+        ctx.font = font(tabFont * 0.78, 500);
+        if (tx + ctx.measureText(stamp.text).width + tabFont * 0.6 < inner.x + inner.w) {
+          ctx.textAlign = 'right';
+          ctx.textBaseline = 'middle';
+          ctx.fillStyle = stamp.color || t.fg4;
+          ctx.fillText(stamp.text, inner.x + inner.w, inner.y + tabH / 2);
+        }
+      }
+      const listY = inner.y + tabH + tabFont * 0.5;
+      const listH = inner.y + inner.h - listY;
+      if (!items.length) {
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = t.fg4;
+        ctx.font = font(Math.max(13, Math.min(inner.h * 0.08, 20)), 400);
+        ctx.textAlign = 'left';
+        ctx.fillText(!d ? '加载中…' : '暂无数据', inner.x, listY + Math.min(listH, 24) / 2);
+        return;
+      }
+
+      // 一行一条：字号跟着宽度走，条数跟着高度走，行高再把剩余空间摊平
+      const rowFont = Math.max(13, Math.min(inner.w * 0.028, 24));
+      const rows = Math.max(1, Math.floor(listH / (rowFont * 1.9)));
+      const rowH = Math.min(listH / rows, rowFont * 2.4);
+      const rankW = rowFont * 1.6;
+      ctx.font = font(rowFont * 0.88, 400, true);
+      const hotW = Math.max(
+        ...items.slice(0, rows).map((it) => (it.hot == null ? 0 : ctx.measureText(String(it.hot)).width))
+      );
+      const titleW = inner.w - rankW - hotW - rowFont * (hotW ? 1.4 : 0);
+
+      items.slice(0, rows).forEach((it, i) => {
+        const cy = listY + i * rowH + rowH / 2;
+        ctx.textBaseline = 'middle';
+        ctx.font = font(rowFont * 0.88, 600, true);
+        ctx.fillStyle = t.fg4;
+        ctx.textAlign = 'left';
+        ctx.fillText(String(i + 1), inner.x, cy);
+
+        ctx.font = font(rowFont, 400);
+        ctx.fillStyle = t.fg2;
+        ctx.fillText(ellipsis(ctx, it.title, Math.max(20, titleW)), inner.x + rankW, cy);
+
+        if (it.hot != null && hotW) {
+          ctx.font = font(rowFont * 0.88, 400, true);
+          ctx.fillStyle = t.fg4;
+          ctx.textAlign = 'right';
+          ctx.fillText(String(it.hot), inner.x + inner.w, cy);
+        }
+      });
+    },
+  },
+
+  // 假期倒计时：按宽高切四种版式（横版大数字+列表 / 竖版列表 / 横版单条 / 方形大数字）
+  holiday: {
+    label: '假期',
+    icon: '<path d="M3 6h10v7.5H3z"/><path d="M3 9h10M6.2 3.5v3M9.8 3.5v3"/>',
+    min: [1, 1],
+    needs: { kind: 'holiday', ttl: 1800000 },
+    draw(ctx, r, cfg, d, t) {
+      const pad = Math.max(10, r.w * 0.05);
+      const inner = card(ctx, r, t, { title: cfg.title || '', pad });
+      const items = (d && d.upcoming) || [];
+      if (!items.length) {
+        ctx.fillStyle = t.fg4;
+        ctx.font = font(Math.max(12, Math.min(inner.h * 0.12, 20)), 400);
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillText(!d ? '加载中…' : '暂无数据', inner.x, inner.y + inner.h * 0.05);
+        return;
+      }
+      const next = items[0];
+      const label = next.ongoing ? `${next.name}·假期中` : `${next.name}还有`;
+
+      // 竖版：一假期一行，条数由高度决定
+      if (inner.h > inner.w * 1.15) {
+        const rowH = Math.max(66, Math.min(inner.w * 0.36, 120));
+        const rows = Math.max(1, Math.min(items.length, Math.floor(inner.h / rowH)));
+        const h = Math.min(rowH, inner.h / rows);
+        items.slice(0, rows).forEach((it, i) => {
+          dashed(ctx, inner.x, inner.y + i * h, inner.x + inner.w, inner.y + i * h);
+          holidayRow(ctx, inner.x, inner.y + i * h, inner.w, h, it, t);
+        });
+        dashed(ctx, inner.x, inner.y + rows * h, inner.x + inner.w, inner.y + rows * h);
+        return;
+      }
+
+      // 宽且够高：左边一个大的，右边列后面几个（与 4×2 / 5×2 一致）
+      if (inner.w >= 520 && inner.h >= 210) {
+        const leftW = inner.w * 0.44;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = t.fg3;
+        ctx.font = font(Math.max(12, Math.min(inner.h * 0.14, inner.w * 0.05)), 500);
+        ctx.fillText(label, inner.x, inner.y + inner.h * 0.17);
+        bigDays(ctx, inner.x, inner.y + inner.h * 0.62, leftW * 0.96, Math.min(inner.h * 0.34, leftW * 0.62),
+          next.ongoing ? next.left : next.until, t, 'left');
+        ctx.fillStyle = t.fg3;
+        ctx.font = font(Math.max(11, Math.min(inner.h * 0.13, inner.w * 0.04)), 400);
+        ctx.fillText(dateRange(next), inner.x, inner.y + inner.h * 0.86);
+
+        const rest = items.slice(1);
+        const x0 = inner.x + leftW + inner.w * 0.03;
+        const wR = inner.x + inner.w - x0;
+        const rowH = Math.max(56, Math.min(inner.h * 0.24, 96));
+        const rows = Math.max(1, Math.min(rest.length, Math.floor(inner.h / rowH)));
+        const h = Math.min(rowH, inner.h / rows);
+        rest.slice(0, rows).forEach((it, i) => {
+          dashed(ctx, x0, inner.y + i * h, x0 + wR, inner.y + i * h);
+          holidayRow(ctx, x0, inner.y + i * h, wR, h, it, t);
+        });
+        dashed(ctx, x0, inner.y + rows * h, x0 + wR, inner.y + rows * h);
+        return;
+      }
+
+      // 横版：名称/日期在左，大数字在右
+      if (inner.w > inner.h * 1.25) {
+        const nameSize = Math.max(13, Math.min(inner.h * 0.24, inner.w * 0.07));
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = t.fg2;
+        ctx.font = font(nameSize, 500);
+        ctx.fillText(next.name, inner.x, inner.y + inner.h * 0.34);
+        ctx.fillStyle = t.fg3;
+        ctx.font = font(Math.max(11, nameSize * 0.82), 400);
+        ctx.fillText(dateRange(next), inner.x, inner.y + inner.h * 0.7);
+        bigDays(ctx, inner.x + inner.w, inner.y + inner.h * 0.68, inner.w * 0.62,
+          Math.min(inner.h * 0.5, inner.w * 0.3), next.ongoing ? next.left : next.until, t, 'right');
+        return;
+      }
+
+      // 方形：名称在上，大数字在下（小尺寸不带「天」，跟参考图一致）
+      const nameSize = Math.max(11, Math.min(inner.w * 0.17, inner.h * 0.16));
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = t.fg3;
+      ctx.font = font(nameSize, 500);
+      ctx.fillText(next.ongoing ? label : next.name, inner.x + inner.w / 2, inner.y + inner.h * 0.3);
+      bigDays(ctx, inner.x + inner.w / 2, inner.y + inner.h * 0.72, inner.w * 0.9,
+        Math.min(inner.w * 0.5, inner.h * 0.42), next.ongoing ? next.left : next.until, t, 'center', '');
+    },
+  },
 };
 
-export const NEEDS = (type) => WIDGETS[type] && WIDGETS[type].needs;
+/** 热榜数据源：id 与 host.py 的 NEWS 一一对应，顺序即 Tab 顺序 */
+export const NEWS_TABS = [
+  ['toutiao', '今日头条'],
+  ['baidu', '百度'],
+  ['zhihu', '知乎'],
+  ['weibo', '微博'],
+  ['v2ex', 'V2EX'],
+  ['juejin', '掘金'],
+];
+const NEWS_LABEL = Object.fromEntries(NEWS_TABS);
+
+/** 勾选的数据源（默认全开；未知 id 丢掉） */
+export function newsSources(cfg) {
+  const picked = cfg && Array.isArray(cfg.sources) ? cfg.sources : NEWS_TABS.map(([id]) => id);
+  return picked.filter((id) => NEWS_LABEL[id]);
+}
 export { card, tracked, font, roundRect, fitFont, ellipsis, weatherIcon, weatherKind };

@@ -337,6 +337,14 @@ static int raw_read(link_t *l, void *buf, uint32_t *len, int timeout_ms) {
 
 static double now_ms(void) { return wall_ms(); }
 
+static void sleep_ms(int ms) {
+#ifdef _WIN32
+  Sleep((DWORD)ms);
+#else
+  usleep((useconds_t)ms * 1000);
+#endif
+}
+
 static int send_cmd(link_t *l, uint8_t kind, uint16_t flags, uint32_t offset, uint32_t raw, const void *payload,
                     uint32_t len) {
   uint8_t *h = l->tx;
@@ -425,7 +433,27 @@ static void rgb_to_bgr565(const uint8_t *rgb, uint16_t *out) {
  * 改成按块压缩：每块 raw=512000（= QD_BLOCK_BYTES 上限）、codec=LZ4，固件逐块解到
  * framebuffer 对应偏移，既不会超限，单包也更小、更好重试。
  */
-static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
+/* 推一帧；raw_mode=1 时不压缩（flags=0 裸块），用来绕开固件 LZ4 解码的坑。
+ * 返回 0=成功 / 1=设备没 ACK（可重试）/ -1=写失败（链路已死） */
+/* 固件 LZ4 解码对某些块会直接 TIMEOUT（同一画面必现）。攒住这些块的原始哈希，
+ * 下次遇到同一块就直接发裸块，省掉两次失败重试。 */
+static uint32_t bad_blocks[8];
+static int bad_count;
+static double lz4_bad_until;  /* 最近踩过 LZ4 的坑：这段时间整帧直接发裸块 */
+
+static int block_is_bad(uint32_t h) {
+  for (int i = 0; i < bad_count; i++)
+    if (bad_blocks[i] == h) return 1;
+  return 0;
+}
+
+static void remember_bad(uint32_t h) {
+  if (block_is_bad(h)) return;
+  if (bad_count < (int)(sizeof bad_blocks / sizeof bad_blocks[0])) bad_blocks[bad_count++] = h;
+  else memmove(bad_blocks, bad_blocks + 1, sizeof bad_blocks - sizeof bad_blocks[0]), bad_blocks[bad_count - 1] = h;
+}
+
+static int push_full_once(link_t *l, int raw_mode, uint32_t *wire, uint32_t *ms) {
   static char *comp;
   static int cap;
   if (!cap) {
@@ -435,24 +463,63 @@ static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
   }
   double t0 = now_ms();
   uint32_t h = xxh32(fbuf, FRAME_BYTES);
-  if (send_cmd(l, QD_BEGIN, 0, 0, FRAME_BYTES, NULL, 0)) link_lost("write-begin");
-  if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) link_lost("no-ack-begin");
+  if (send_cmd(l, QD_BEGIN, 0, 0, FRAME_BYTES, NULL, 0)) return -1;
+  if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) return 1;
   uint32_t sent = 64;
   for (uint32_t off = 0; off < FRAME_BYTES; off += BLOCK_BYTES) {
     uint32_t n = FRAME_BYTES - off < BLOCK_BYTES ? FRAME_BYTES - off : BLOCK_BYTES;
-    int clen = LZ4_compress_default((const char *)fbuf + off, comp, (int)n, cap);
-    if (clen <= 0) return -2;
-    if (send_cmd(l, QD_DATA, 1, off, n, comp, (uint32_t)clen)) link_lost("write-data");
-    if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) link_lost("no-ack-data");
-    sent += (uint32_t)clen + 32;
+    const void *payload;
+    uint32_t clen;
+    if (!raw_mode && block_is_bad(xxh32((const uint8_t *)fbuf + off, n))) raw_mode = 1; /* 这块以前挂过 */
+    if (raw_mode) {
+      payload = (const uint8_t *)fbuf + off;  /* 裸像素：固件 flags=0 直接收 */
+      clen = n;
+    } else {
+      int c = LZ4_compress_default((const char *)fbuf + off, comp, (int)n, cap);
+      if (c <= 0) return -1;
+      payload = comp;
+      clen = (uint32_t)c;
+    }
+    if (send_cmd(l, QD_DATA, raw_mode ? 0 : 1, off, n, payload, clen)) return -1;
+    if (wait_ack(l, l->seq, 3) || reply_body[0]) {
+      /* 失败时把这块的大小打出来：块序号 / 未压缩 / 实际发出 / 设备状态码 */
+      fprintf(stderr, "cs80: data fail block=%u raw=%u clen=%u status=%u mode=%s\n",
+              off / BLOCK_BYTES, n, clen, reply_body[0], raw_mode ? "raw" : "lz4");
+      if (!raw_mode) {
+        remember_bad(xxh32((const uint8_t *)fbuf + off, n));
+        lz4_bad_until = now_ms() + 120000;
+      }
+      return 1;
+    }
+    sent += clen + 32;
   }
-  if (send_cmd(l, QD_COMMIT, 1, h, 0, NULL, 0)) link_lost("write-commit");
-  if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) link_lost("no-ack-commit");
+  if (send_cmd(l, QD_COMMIT, 1, h, 0, NULL, 0)) return -1;
+  if (wait_ack(l, l->seq, ACK_TRIES) || reply_body[0]) return 1;
   fbuf_hash = h;
   fbuf_valid = 1;
   *wire = sent + 32;
   *ms = (uint32_t)(now_ms() - t0);
   return 0;
+}
+
+/* 整帧：先 LZ4；设备没 ACK 就原地重试（不重启 sidecar），最后一遍改发不压缩的裸块。
+ * 固件 LZ4 解码遇到某些数据会直接 TIMEOUT（status=8，同一画面 100% 复现），
+ * 裸块能绕过去；只有连裸块都不行才真正判定链路丢失。 */
+static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
+  /* 尝试顺序：LZ4（快）→ 裸块（一定能过，2 MB，~200 ms）→ 再 LZ4（万一裸块反而过不去）。
+   * 固件对这块不 ACK 时，它自己的接收超时是 3 s，所以「第一次踩坑」大约 3 s，之后走裸块就快了。 */
+  int skip_lz4 = now_ms() < lz4_bad_until;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    int raw_mode = attempt == 1 ? 1 : (attempt == 0 ? skip_lz4 : 0);
+    double t_attempt = now_ms();
+    int r = push_full_once(l, raw_mode, wire, ms);
+    if (r == 0) return 0;
+    if (r < 0) break;
+    fprintf(stderr, "cs80: full frame retry %d (raw=%d, %.0fms)\n", attempt + 1, raw_mode, now_ms() - t_attempt);
+    sleep_ms(300);
+  }
+  link_lost("no-ack-data");
+  return -1;
 }
 
 /* 局部：tile 列表 → 应用到影子 → PATCH(offset=旧哈希) */
@@ -654,9 +721,21 @@ int main(int argc, char **argv) {
   _setmode(0, _O_BINARY); /* stdin 走二进制，否则 0x1A/0x0D 会被改写 */
 #endif
 
-  /* 握手；老固件/新固件都只是给个块大小与特性位 */
-  send_cmd(&l, QD_HELLO, 0, 0, 0, NULL, 0);
-  wait_ack(&l, l.seq, 20);
+  /* 握手；老固件/新固件都只是给个块大小与特性位。
+   *
+   * 刚插上 Type-C 时固件还要跑完自己的 USB 初始化（实测 2–5 s 内 QDC1 一个字节都不回），
+   * 以前"打开接口→立刻 HELLO"把这段当成链路丢失 → 整个 sidecar 重启一轮，白折腾。
+   * 现在最多重试 10 s，真不通才交给 host 重新枚举。 */
+  int handshook = 0;
+  for (int i = 0; i < 10 && !stop; i++) {
+    if (send_cmd(&l, QD_HELLO, 0, 0, 0, NULL, 0)) break;
+    if (!wait_ack(&l, l.seq, 2)) {
+      handshook = 1;
+      break;
+    }
+    sleep_ms(1000);
+  }
+  if (!handshook) link_lost("no-ack-hello");
   json("{\"event\":\"ready\",\"block\":%u,\"status\":%u}", reply_body[5], reply_body[0]);
   send_cmd(&l, QD_HELLO, 2, 0, 0, NULL, 0);
   if (!wait_ack(&l, l.seq, 20)) json("{\"event\":\"features\",\"bits\":%u}", reply_body[5]);

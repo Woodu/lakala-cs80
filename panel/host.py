@@ -8,10 +8,11 @@
 职责边界：
   - 唯一持有 panel/qdc1 sidecar（USB 独占），把帧/局部更新/控屏转给它
   - 存布局 ~/.cs80_panel/layout.json
-  - 抓数据（系统指标 / agent 状态 / 天气 / 股票），带缓存，组件只读缓存
+  - 抓数据（系统指标 / agent / 天气 / 行情 / 热榜 / 假期），带缓存，组件只读缓存
 不负责画像素：像素由浏览器画布算出来再 POST 进来（路线 A：一份渲染代码即编辑器又是设备像素源）。
 """
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -542,6 +543,8 @@ class Device:
         self.bright_pref = load_config().get("brightness")  # 用户偏好（持久化到 ~/.cs80_panel/config.json）
         self.bright_expect = None    # 我们刚发出去、还没确认的值
         self.need_restore = False    # 刚(重)连上：第一条 state 用来“恢复偏好”，不拿来学习
+        self.spawned_at = 0.0  # 本次 sidecar 启动时间，用来判断「刚起来就死」
+        self.quick_deaths = 0  # 连续「刚起来就死」的次数 → 退避，别一秒一轮地重枚举 USB
         self.com = ""  # Windows：QDC1 数据串口（自动从注册表识别）
         self.audio_lock = threading.Lock()  # 上传/播放串行，避免两个请求交错
         self._audio_hash = {}  # (路径, 大小, mtime) → XXH32，重复播放不重算
@@ -558,6 +561,15 @@ class Device:
                 old.wait(timeout=5)
             except Exception:
                 pass
+        # 上一次 host 被 Ctrl-C/kill 时留下的孤儿 sidecar 还握着 USB 接口（macOS 是整机独占），
+        # 新 sidecar 只会一直「打不开设备 (code=-1)」→ 顺手清掉，反正是可执行路径精确匹配。
+        if os.name != "nt":
+            try:
+                subprocess.run(["pkill", "-f", SIDECAR], timeout=3,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        self.spawned_at = time.time()
         self.session += 1
         os.makedirs(CONF_DIR, exist_ok=True)
         err = open(SIDECAR_LOG, "ab")
@@ -688,6 +700,14 @@ class Device:
         while True:
             proc = self.proc
             if proc is None or proc.poll() is not None:
+                # 链路死得快（握手通、推帧就 no-ack-data）时会 5 秒一轮地重启 sidecar：
+                # 退避一下，既少骚扰设备，也让日志/提示不至于刷屏。
+                if self.spawned_at and 0 < time.time() - self.spawned_at < 8:
+                    self.quick_deaths += 1
+                else:
+                    self.quick_deaths = 0
+                if self.quick_deaths:
+                    time.sleep(min(2 ** self.quick_deaths, 10))
                 if not self._spawn():
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 5.0)
@@ -862,12 +882,17 @@ class Cache:
                 return hit[1]
         try:
             val = fn()
-        except Exception as exc:  # 抓不到就退回占位/上次值，不让屏空白
+        except Exception as exc:  # 抓不到就把上次的值顶上去（标 stale），别让屏清空
             with self.lock:
                 hit = self.items.get(key)
-            return (hit[1] if hit else None) or {"error": str(exc), "stale": True}
+            if hit and isinstance(hit[1], dict):
+                return dict(hit[1], stale=True, fetchedAt=int(hit[0] * 1000))
+            return {"error": str(exc), "stale": True}
         with self.lock:
             self.items[key] = (now, val)
+        # fetchedAt：前端据此显示「xx:xx 更新」；毫秒时间戳，和 JS Date.now() 同一口径
+        if isinstance(val, dict):
+            return dict(val, fetchedAt=int(now * 1000), stale=False)
         return val
 
 
@@ -1158,6 +1183,166 @@ def portfolio(symbols):
         except Exception as e:
             items.append({"symbol": sym, "error": str(e)})
     return {"items": items, "source": "mixed"}
+
+
+# ---------- 行情补充源（加密 / GitHub）----------
+COIN_SYMBOL = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "binancecoin": "BNB",
+               "ripple": "XRP", "dogecoin": "DOGE", "cardano": "ADA", "tron": "TRX",
+               "toncoin": "TON", "avalanche-2": "AVAX", "polkadot": "DOT", "chainlink": "LINK"}
+
+
+def crypto(ids):
+    """coingecko 免 key 接口：/api/data/crypto?ids=bitcoin,ethereum"""
+    want = [x.strip() for x in str(ids).split(",") if x.strip()][:8]
+    d = http_json("https://api.coingecko.com/api/v3/simple/price?ids=%s&vs_currencies=usd&include_24hr_change=true"
+                  % ",".join(want))
+    coins = []
+    for cid in want:
+        row = d.get(cid) or {}
+        if row.get("usd") is None:
+            continue
+        coins.append({"id": cid, "symbol": COIN_SYMBOL.get(cid, cid.upper()[:5]), "price": row["usd"],
+                      "pct": round(row.get("usd_24h_change") or 0, 2)})
+    return {"coins": coins, "source": "coingecko"}
+
+
+def github(repo):
+    """GitHub 仓库快照：/api/data/github?repo=owner/name（未授权 60 次/时）"""
+    repo = str(repo).strip("/")
+    d = http_json("https://api.github.com/repos/" + repo,
+                  {"User-Agent": "cs80-panel/1.0", "Accept": "application/vnd.github+json"})
+    return {"repo": d.get("full_name") or repo, "stars": d.get("stargazers_count"),
+            "lang": d.get("language"), "issues": d.get("open_issues_count"),
+            "pushed": d.get("pushed_at"), "source": "github"}
+
+
+# ---------- 热榜资讯 ----------
+# 接口照 newsnow（github.com/newsnext/newsnow）的公开端点：
+# 每源单独 CACHE，一个源抓不到只让那个 Tab 空着，不影响别的 Tab；抓到过一次就沿用上次结果。
+NEWS_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+
+
+def _hot_number(text):
+    """"1234 万热度" → 12340000；纯数字原样返回"""
+    m = re.search(r"([\d.]+)\s*(万|亿)?", str(text or ""))
+    if not m:
+        return None
+    scale = {"万": 10000, "亿": 100000000}.get(m.group(2), 1)
+    return int(float(m.group(1)) * scale)
+
+
+def _news_toutiao():
+    d = http_json("https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc", {"User-Agent": NEWS_UA})
+    return [{"title": x.get("Title"), "hot": _hot_number(x.get("HotValue"))} for x in d.get("data") or []]
+
+
+def _news_baidu():
+    d = http_json("https://top.baidu.com/api/board?platform=pc&tab=realtime", {"User-Agent": NEWS_UA})
+    cards = (d.get("data") or {}).get("cards") or []
+    rows = (cards[0].get("content") if cards else []) or []
+    return [{"title": x.get("query") or x.get("word"), "hot": _hot_number(x.get("hotScore"))} for x in rows]
+
+
+def _news_zhihu():
+    # 知乎对数据中心 IP 会要求登录/过验证；被拒就靠 CACHE 的旧值和其它源兜底
+    d = http_json("https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=50&desktop=true",
+                  {"User-Agent": NEWS_UA, "Referer": "https://www.zhihu.com/hot"})
+    return [{"title": (x.get("target") or {}).get("title"), "hot": _hot_number(x.get("detail_text"))}
+            for x in d.get("data") or []]
+
+
+def _news_weibo():
+    d = http_json("https://weibo.com/ajax/side/hotSearch", {"User-Agent": NEWS_UA, "Referer": "https://weibo.com/"})
+    rows = (d.get("data") or {}).get("realtime") or []
+    return [{"title": x.get("word"), "hot": _hot_number(x.get("num"))}
+            for x in rows if x.get("word") and not x.get("is_ad")]
+
+
+def _news_v2ex():
+    d = http_json("https://www.v2ex.com/api/topics/hot.json", {"User-Agent": NEWS_UA})
+    return [{"title": x.get("title"), "hot": _hot_number(x.get("replies"))} for x in d or []]
+
+
+def _news_juejin():
+    d = http_json("https://api.juejin.cn/content_api/v1/content/article_rank?category_id=1&type=hot",
+                  {"User-Agent": NEWS_UA})
+    return [{"title": (x.get("content") or {}).get("title"),
+             "hot": _hot_number((x.get("content_counter") or {}).get("hot_rank"))}
+            for x in d.get("data") or []]
+
+
+# ---------- 假期 ----------
+# 数据照 holiday-cn（github.com/NateScarlet/holiday-cn）：每年一份 JSON，国务院公布后更新。
+# 只取 isOffDay 的日子（调休上班日丢掉），再把同名连续日期拼成一个假期区间。
+HOLIDAY_URL = "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/%d.json"
+
+
+def _holiday_year(year):
+    d = http_json(HOLIDAY_URL % year, {"User-Agent": NEWS_UA}, timeout=10)
+    return sorted((x["date"], x.get("name") or "假期")
+                  for x in d.get("days") or [] if x.get("isOffDay") and x.get("date"))
+
+
+def _date(s):
+    return datetime.date(*[int(v) for v in str(s).split("-")])
+
+
+def holidays(today=None):
+    today = today or datetime.date.today()
+    days = []
+    for y in (today.year, today.year + 1):
+        val = CACHE.get("hol:%d" % y, 43200, lambda y=y: _holiday_year(y))
+        if isinstance(val, list):
+            days += val
+
+    blocks = []
+    for date_s, name in sorted(days):
+        b = blocks[-1] if blocks else None
+        if b and b["name"] == name and _date(b["end"]) + datetime.timedelta(days=1) == _date(date_s):
+            b["end"] = date_s
+        else:
+            blocks.append({"name": name, "start": date_s, "end": date_s})
+
+    out = []
+    for b in blocks:
+        start, end = _date(b["start"]), _date(b["end"])
+        if end < today:
+            continue
+        out.append(dict(b, length=(end - start).days + 1,
+                        until=max(0, (start - today).days),
+                        left=max(0, (end - today).days + 1),
+                        ongoing=start <= today <= end))
+    out.sort(key=lambda x: x["start"])
+    return {"next": out[0] if out else None, "upcoming": out[:8], "today": today.isoformat()}
+
+
+NEWS = {
+    "toutiao": _news_toutiao,
+    "baidu": _news_baidu,
+    "zhihu": _news_zhihu,
+    "weibo": _news_weibo,
+    "v2ex": _news_v2ex,
+    "juejin": _news_juejin,
+}
+
+
+def news(sources):
+    """{sourceId: [{title, hot}]}，只抓请求里点名的几个源；有源回退到旧值就标 stale"""
+    out, stale = {}, False
+    for sid in [s.strip() for s in str(sources).split(",") if s.strip()][:8]:
+        fn = NEWS.get(sid)
+        if not fn:
+            continue
+        val = CACHE.get("news:" + sid, 180, fn)
+        if isinstance(val, list):
+            out[sid] = [x for x in val if isinstance(x, dict) and x.get("title")]
+        else:
+            out[sid] = []
+            stale = True
+    if stale:
+        out["stale"] = True  # 组件据此在 Tab 右上角显示「更新失败·重取中」
+    return out
 
 
 
@@ -1847,6 +2032,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/data/github":
             repo = (qs.get("repo") or ["tauri-apps/tauri"])[0]
             return self._send(200, CACHE.get("gh:" + repo, 300, lambda: github(repo)))
+        if path == "/api/data/news":
+            return self._send(200, news((qs.get("sources") or ["toutiao,baidu,zhihu,weibo"])[0]))
+        if path == "/api/data/holiday":
+            return self._send(200, CACHE.get("holiday", 3600, holidays))
         if path == "/api/data/music":
             return self._send(200, CACHE.get("mu", 3, music))
         if path == "/api/screensaver":

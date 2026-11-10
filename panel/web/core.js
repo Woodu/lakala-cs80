@@ -37,7 +37,47 @@ export async function loadLayout() {
   // 设计 token 只来自 widgets.js（老布局里残留的 theme 字段直接忽略，避免旧配色回流）
   layout.theme = { ...THEME };
   state.layout = layout;
+  // 先把上次落盘的数据铺进去：换面板/重开窗口立刻有内容，不用等网络
+  state.data = { ...loadDataCache(), ...state.data };
   return state.layout;
+}
+
+// ---------------- 数据本地缓存 ----------------
+// 目的：切面板、重开窗口时先用旧数据画出来（组件自带「HH:MM 更新」小字），
+// 后台再按各组件 TTL 拉新的。只缓存能 JSON 化的数据，超大/异常的丢掉。
+const DATA_CACHE = 'cs80:data:v1';
+const DATA_CACHE_MAX = 200000; // 单个组件超过 200 KB 就不缓存
+
+function loadDataCache() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DATA_CACHE) || '{}');
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+let cacheTimer = null;
+function saveDataCache() {
+  clearTimeout(cacheTimer);
+  cacheTimer = setTimeout(() => {
+    try {
+      const live = new Set();
+      for (const p of pages()) {
+        if (p.type === 'custom') live.add(p.id);
+        for (const w of p.widgets || []) live.add(w.id);
+      }
+      const out = {};
+      for (const [id, d] of Object.entries(state.data)) {
+        if (!live.has(id) || !d || typeof d !== 'object') continue;
+        const text = JSON.stringify(d);
+        if (text && text.length <= DATA_CACHE_MAX) out[id] = JSON.parse(text);
+      }
+      localStorage.setItem(DATA_CACHE, JSON.stringify(out));
+    } catch (e) {
+      /* 配额满了就当没缓存，不影响显示 */
+    }
+  }, 800);
 }
 
 export async function saveLayout() {
@@ -91,6 +131,18 @@ export function touchWidget(w) {
   for (const [k, v] of Object.entries(def.config || {})) if (w.config[k] === undefined) w.config[k] = v;
 }
 
+/** 给数据打上「何时取到的」/「这份是旧的」标记：拉失败时组件靠它显示小字，而不是把数据清空 */
+function stamped(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+  return { ...data, fetchedAt: data.fetchedAt || Date.now(), stale: data.stale === true };
+}
+
+/** 拉取失败：保留上次的数据，只标 stale；一条都没拿到过才给 error 占位 */
+function keepLast(key, err) {
+  const prev = state.data[key];
+  return prev && prev.fetchedAt ? { ...prev, stale: true } : { error: String(err), stale: true };
+}
+
 /** 数据调度：每个组件按自己的 needs.ttl 拉数据，只通知变化过的组件 */
 export function startDataLoop(onChange) {
   const last = {};
@@ -104,18 +156,23 @@ export function startDataLoop(onChange) {
       const ttl = need.ttl || 60000;
       const key = 'page:' + page.id;
       if (last[key] && Date.now() - last[key] < ttl) continue;
+      // needs.when 说不刷（如休盘）且有旧数据 → 不拉，屏上继续显示上次的
+      if (need.when && !need.when(page.config || {}) && (state.data[page.id] || {}).fetchedAt) continue;
       last[key] = Date.now();
       const q = need.query ? need.query(page.config || {}) : {};
       const qs = new URLSearchParams(q).toString();
       try {
-        const data = await api(`/api/data/${need.kind}${qs ? '?' + qs : ''}`);
+        const data = stamped(await api(`/api/data/${need.kind}${qs ? '?' + qs : ''}`));
         if (JSON.stringify(data) !== JSON.stringify(state.data[page.id])) {
           state.data[page.id] = data;
+          saveDataCache();
           onChange(page);
         }
       } catch (e) {
-        state.data[page.id] = { error: String(e) };
+        state.data[page.id] = keepLast(page.id, e);
+        saveDataCache();
         last[key] = Date.now() - ttl + 15000;
+        onChange(page);
       }
     }
     const page = gridPage();
@@ -126,16 +183,20 @@ export function startDataLoop(onChange) {
       const ttl = def.needs.ttl || 60000;
       const due = ttl === 0 || !last[w.id] || Date.now() - last[w.id] > ttl;
       if (!due) continue;
+      // 休盘/不需要刷新时保持旧数据：有数据就不再拉，等下次该拉的时候自然接上
+      if (def.needs.when && !def.needs.when(w.config || {}) && (state.data[w.id] || {}).fetchedAt) continue;
       last[w.id] = Date.now();
       const q = def.needs.query ? def.needs.query(w.config || {}) : {};
       const qs = new URLSearchParams(q).toString();
       try {
-        const data = await api(`/api/data/${def.needs.kind}${qs ? '?' + qs : ''}`);
+        const data = stamped(await api(`/api/data/${def.needs.kind}${qs ? '?' + qs : ''}`));
         const changed = JSON.stringify(data) !== JSON.stringify(state.data[w.id]);
         state.data[w.id] = data;
+        saveDataCache();
         if (changed) onChange(w);
       } catch (e) {
-        state.data[w.id] = { error: String(e) };
+        state.data[w.id] = keepLast(w.id, e);
+        saveDataCache();
         last[w.id] = Date.now() - ttl + 15000; // 失败别等满 TTL，15 秒后重试
         onChange(w);
       }

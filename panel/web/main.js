@@ -23,6 +23,13 @@ let tickMs = 200;
 let tickTimer = null;
 let setRateFn = null;
 let wasUp = null;
+let lastDeviceToast = 0;
+/** 设备重连提示限流：链路抖动时 session 会连着变，别每 5 秒弹一次 */
+function toastDevice(msg) {
+  if (Date.now() - lastDeviceToast < 30000) return;
+  lastDeviceToast = Date.now();
+  toast(msg);
+}
 let lastFullPush = 0;
 let loadedBuild = null;
 let reloadedFor = null;
@@ -46,7 +53,7 @@ function paintDevice(st) {
   // 设备重新上线（拔插/休眠唤醒后 sidecar 重启）→ 必须整帧重推，设备端 framebuffer 状态已丢
   if (up && wasUp === false) {
     pusher.markFull();
-    toast('设备已重连，重推整帧');
+    toastDevice('设备已重连，重推整帧');
   }
   wasUp = up;
   // 局部更新失败（设备换了/固件重启导致 base 哈希不匹配）→ 退回整帧
@@ -80,7 +87,7 @@ function paintDevice(st) {
   // sidecar 重连（device 重启/拔插）后设备丢了帧状态 → 整帧重推
   if (pusher.session !== null && st.session !== pusher.session) {
     pusher.markFull();
-    toast('设备重连，已整帧重推');
+    toastDevice('设备重连，已整帧重推');
   }
   pusher.session = st.session;
 }
@@ -91,6 +98,11 @@ async function boot() {
   const dataLoop = startDataLoop((w) => renderTile(w));
   await initEditor({
     onLayoutChange: () => pusher.markFull(),
+    // 拖动/缩放期间屏上先不动，松手统一推一帧
+    onInteract: (busy) => {
+      pusher.interacting = busy;
+      if (!busy) pusher.markFull();
+    },
     invalidateData: (id) => dataLoop.invalidate(id),
     invalidatePage: (id) => dataLoop.invalidatePage(id),
   });
@@ -226,6 +238,7 @@ async function boot() {
   // 渲染 + 推送：时钟秒级；屏保时提速到 ~11fps
   const tick = () => {
     if (!saver.active) renderAll();
+    if (pusher.interacting) return; // 拖动中不推帧（见 editor.js）
     if (Date.now() - lastFullPush > 60000 && !saver.active) {
       pusher.markFull();
       lastFullPush = Date.now();

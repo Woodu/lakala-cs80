@@ -10,14 +10,12 @@ const MONO = '"SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace';
 
 const UP = '#ef6f6f';
 const DOWN = '#5fc98d';
-const FG = '#d6d7dc';
 const FG2 = '#b4b5bd';
 const FG3 = '#8b8c96';
 const FG4 = '#52535c';
 const CARD = '#1a1c22';
-const ACCENT = '#d8bb85';
 
-import { minuteChart, stockRow } from '../widgets.js';
+import { minuteChart, stockRow, tradingHours, freshStamp } from '../widgets.js';
 
 const font = (size, weight = 400, mono = false) => `${weight} ${size}px ${mono ? MONO : FONT}`;
 
@@ -42,7 +40,7 @@ function tracked(ctx, text, x, y, spacing) {
 }
 
 export default {
-  needs: { kind: 'portfolio', ttl: 20000, query: (cfg) => ({ symbols: cfg.symbols || 'sh000001' }) },
+  needs: { kind: 'portfolio', ttl: 20000, when: tradingHours, query: (cfg) => ({ symbols: cfg.symbols || 'sh000001' }) },
 
   draw(ctx, size, data, cfg, theme) {
     const { w, h } = size;
@@ -56,6 +54,14 @@ export default {
     ctx.fillStyle = FG4;
     ctx.font = font(20, 600);
     tracked(ctx, (cfg.title || '自选股').toUpperCase(), pad, pad, 2.6);
+    // 数据新鲜度：休盘时停在收盘价，拉失败则标黄
+    const stamp = freshStamp(data);
+    if (stamp) {
+      ctx.textAlign = 'left';
+      ctx.font = font(18, 400, true);
+      ctx.fillStyle = stamp.color || FG4;
+      ctx.fillText(stamp.text, pad, pad + 30);
+    }
     ctx.textAlign = 'right';
     ctx.font = font(18, 400, true);
     ctx.fillText(

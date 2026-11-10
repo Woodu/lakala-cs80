@@ -3,7 +3,7 @@ import {
   CELL, COLS, ROWS, W, H, state, activePage, gridPage, loadLayout, loadPageModule, saveLayout,
   setActivePage, touchWidget, widgetById,
 } from './core.js';
-import { THEME, WIDGETS } from './widgets.js';
+import { THEME, WIDGETS, NEWS_TABS, newsSources } from './widgets.js';
 
 const { GridStack } = window;
 
@@ -21,6 +21,7 @@ const FIELDS = {
   github: [['repo', 'owner/repo']],
   timer: [['label', '名称'], ['time', '到点时间 HH:MM']],
   note: [['text', '文字']],
+  news: [['rotate', '自动切换秒数']],
 };
 
 export const tiles = new Map();
@@ -28,6 +29,8 @@ let grid = null;
 let hooks = {};
 let saveTimer = null;
 let customCanvas = null;
+let dragging = false;
+const interacting = () => dragging;
 
 const el = (sel) => document.querySelector(sel);
 
@@ -208,6 +211,12 @@ function bindTileEvents(wrap, w) {
 function mountGrid() {
   const page = gridPage();
   tiles.clear();
+  // 换画布时要把上一张的 grid 实例和 DOM 一起拆掉：否则旧组件还留在屏幕上、新组件会叠上去
+  if (grid) {
+    grid.destroy(false);
+    grid = null;
+  }
+  el('#grid').innerHTML = '';
   el('#custom-holder').hidden = true;
   el('#board').hidden = false;
 
@@ -221,7 +230,7 @@ function mountGrid() {
       animate: true,
       disableOneColumnMode: true,
       handle: '.tile-hit',
-      resizable: { handles: 'e,se,s,sw,w' },
+      resizable: { handles: 'nw,e,se,s,sw,w' },
       draggable: { scroll: true, appendTo: 'body' },
     },
     el('#grid')
@@ -237,10 +246,21 @@ function mountGrid() {
     renderTile(w);
   }
 
+  // 拖动/缩放过程中只更新编辑器，推帧留到松手：整帧推送又慢（2 MB）又可能踩固件的 LZ4 坑，
+  // 每 200ms 推一帧会让屏上的画面滞后好几秒。
+  grid.on('dragstart resizestart', () => {
+    dragging = true;
+    if (hooks.onInteract) hooks.onInteract(true);
+  });
+  grid.on('dragstop resizestop', () => {
+    dragging = false;
+    if (hooks.onInteract) hooks.onInteract(false);
+    hooks.onLayoutChange && hooks.onLayoutChange();
+  });
   grid.on('change', (_ev, nodes) => {
     (nodes || []).forEach(syncCellFromNode);
     scheduleSave();
-    hooks.onLayoutChange && hooks.onLayoutChange();
+    if (!interacting()) hooks.onLayoutChange && hooks.onLayoutChange();
     renderInspector();
   });
 }
@@ -426,6 +446,7 @@ function renderInspector() {
       )
       .join('')}
     ${w.type === 'agent' ? agentToggles(w) : ''}
+    ${w.type === 'news' ? newsToggles(w) : ''}
     <div class="section-label">位置 / 尺寸（格）</div>
     <div class="grid4">
       ${['x', 'y', 'w', 'h']
@@ -489,6 +510,18 @@ function renderInspector() {
       hooks.onLayoutChange && hooks.onLayoutChange();
     });
   });
+  box.querySelectorAll('[data-news]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const picked = new Set(newsSources(w.config));
+      if (input.checked) picked.add(input.dataset.news);
+      else picked.delete(input.dataset.news);
+      w.config.sources = NEWS_TABS.filter(([id]) => picked.has(id)).map(([id]) => id);
+      if (hooks.invalidateData) hooks.invalidateData(w.id);
+      renderTile(w);
+      scheduleSave();
+      hooks.onLayoutChange && hooks.onLayoutChange();
+    });
+  });
   box.querySelector('[data-act="dup"]').onclick = () => duplicateWidget(w.id);
   box.querySelector('[data-act="del"]').onclick = () => removeWidget(w.id);
 }
@@ -542,6 +575,20 @@ function agentToggles(w) {
     <div class="hint">取消 Agent ＝ 整组隐藏；只取消某个任务 ＝ 该 Agent 保留、这个任务不显示${
       hidden.size || hiddenTasks.size ? `（已隐藏 ${hidden.size} 个 Agent、${hiddenTasks.size} 条任务）` : ''
     }</div>`;
+}
+
+/** 资讯组件：勾选的数据源 = 顶部 Tab（按 NEWS_TABS 顺序，别让用户点选顺序影响 Tab 顺序） */
+function newsToggles(w) {
+  const on = new Set(newsSources(w.config));
+  const rows = NEWS_TABS.map(
+    ([id, label]) => `<label class="check">
+      <input type="checkbox" data-news="${esc(id)}" ${on.has(id) ? 'checked' : ''}>
+      <span>${esc(label)}</span>
+    </label>`
+  ).join('');
+  return `<div class="section-label">数据源（顶部 Tab）</div>
+    <div class="checks">${rows}</div>
+    <div class="hint">勾选的源按秒数自动轮换 Tab；组件高度决定显示多少条。</div>`;
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
