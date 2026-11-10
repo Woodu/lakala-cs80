@@ -10,6 +10,11 @@
 import sys
 import time
 
+try:  # Windows 控制台是 GBK 时，print 里的 ✗/✓ 会直接抛 UnicodeEncodeError
+    sys.stdout.reconfigure(errors="replace")
+except Exception:
+    pass
+
 sys.path.insert(0, ".")
 
 import serial
@@ -146,9 +151,11 @@ def main():
 
         if verify:
             print("读回校验 ...")
-            back = native._read_flash(io, APP_ADDR, len(app))
+            # 1 KB 分块：native._read_flash() 默认 0x3000 的读回不可靠（会误报不一致）
+            back = native._read_flash(io, APP_ADDR, len(app), chunk=1024)
             if back[:len(app)] != app:
-                print("✗ 读回不一致！保持下载模式，请勿断电。")
+                diff = sum(1 for x, y in zip(back, app) if x != y)
+                print("✗ 读回不一致（%d 字节不同）！保持下载模式，请勿断电。" % diff)
                 return 2
             print("✓ 读回一致")
 

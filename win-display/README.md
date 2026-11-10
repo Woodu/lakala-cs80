@@ -4,7 +4,8 @@
 
 | 文件 | 用途 |
 |---|---|
-| `qdisplay/qdisplay_native.bin` | **QDisplay 固件 APP**（刷到 `0x60260000`，刷机流程见 [`../docs/firmware.md`](../docs/firmware.md)） |
+| `qdisplay/qdisplay_native.bin` | **QDisplay 固件 APP 0.3.0**（154400 B，`features=0x23f`；刷到 `0x60260000`，流程见 [`../docs/firmware.md`](../docs/firmware.md)） |
+| `qdisplay/qdisplay_native_031.bin` | **QDisplay 固件 APP 0.3.1**（155456 B，`features=0x27f`，来自上游 `v0.3.1-demo.20261010` release，CC BY-NC-SA 4.0）。多出待机/唤醒（HELLO 18）与 90 s 断连关背光；**等待页带 90 s 倒计时每秒重绘**，建议先跑 `patch_waiting_page.py` |
 | `qdisplay/QDisplay-0.3.0-x64.msi` | 官方 Windows 上位机安装包（装完注册 `QDisplayDevice` 服务）。只在对照/临时排障时用 |
 | `camera_shot.ps1` | 用摄像头拍屏幕（无窗口），用来客观确认屏上到底显示什么 |
 | `cam_stats.ps1` | 对拍到的截图做分带颜色统计（不用肉眼判断） |

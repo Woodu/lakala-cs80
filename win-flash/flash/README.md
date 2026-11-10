@@ -7,6 +7,9 @@
 | 脚本 | 作用 |
 |---|---|
 | **`qdisplay_app.py`** | 把 **QDisplay native APP** 写到 `0x60260000`（**只写 APP 分区**，不格式化、不动 NV）。当前设备就是这个状态 |
+| **`patch_waiting_page.py`** | 给 0.3.1+ 的 `qdisplay_native.bin` 打 1 字节补丁：**关掉「等待连接」页每秒重绘**（倒计时），打完后等待页真静态。0.3.0 bin 会直接报「不用打补丁」，详见 [`../../docs/firmware.md`](../../docs/firmware.md) 的「2.5 关掉等待页每秒重绘」 |
+| **`appimg.py`** | APP2 容器头 `u32@8 = crc32(整文件)` 的重算/校验 —— **手改任何字节后必须重算**，否则 loader 不启动 APP（屏黑、COM15 无应答、AT 口正常） |
+| **`reset_download.py`** | 设备卡在下载模式（`PDL connect` 超时，其实 FDL2 还在跑）时走 BSL 发 `NORMAL_RESET` 重启，不用拔插 |
 | **`flash_at.py`** | 按 `fw.pac` **整包刷 QuecPython**（含格式化文件系统 + 重建 NV）。用于「恢复成 Python 环境」 |
 
 ---
@@ -97,6 +100,9 @@ py\python.exe flash_at.py           :: 整包刷 fw.pac（会问 y）
 | 文件 | 说明 |
 |---|---|
 | `qdisplay_app.py` | 只写 APP 分区（PDL → FDL1 → FDL2 → BSL 写 → 读回 → 复位） |
+| `patch_waiting_page.py` | 关掉 0.3.1+ 等待页的每秒重绘（1 字节：`cmp r3,r6` → `cmp r3,r3`） |
+| `appimg.py` | APP2 头部 `u32@8 = crc32(整文件)`，手改字节后必须重算 |
+| `reset_download.py` | 卡下载模式时用 BSL `NORMAL_RESET` 让设备重启 |
 | `flash_at.py` | 整包刷 PAC（QuecPython 恢复） |
 | `fw.pac` | 官方 PAC（FDL1/FDL2/BOOT/AP/APPIMG/PS/NV…） |
 | `third_party/sprdflash/` | 纯 Python 的 Spreadtrum/UNISOC 刷写实现（PDL/BSL/PAC） |

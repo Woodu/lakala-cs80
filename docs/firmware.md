@@ -4,7 +4,8 @@
 
 | 固件 | 状态 | 用途 |
 |---|---|---|
-| QDisplay native APP（写在 `0x60260000`，154 KB） | ✅ 日常使用 | 接受 QDC1 帧，LZ4 → framebuffer → DSI 上屏 |
+| QDisplay native APP **0.3.0**（`win-display/qdisplay/qdisplay_native.bin`，154400 B） | ✅ 本仓默认 | `features=0x23f`；无待机/唤醒，等待页只画一次 |
+| QDisplay native APP **0.3.1**（`win-display/qdisplay/qdisplay_native_031.bin`，155456 B） | ⏸ 可选（上游最新，**本机实测不稳，未采用**） | `features=0x27f`，多 bit `0x40`；增加 HELLO 18 待机/唤醒、90 s 断连关背光，**等待页带 90 s 倒计时（每秒重绘 → 每秒闪，可用 `patch_waiting_page.py` 关掉）**。2026-11 实测：CRC 正确的官方 0.3.1 能刷入并启动（读到过 `features=0x27f`），但 QDC1 **间歇性不应答**（12 次探测 5 次无响应，同一会话第 2–3 条命令也常超时），像 APP 崩溃重启循环；同机 0.3.0 稳定 → 已回退 0.3.0 |
 | QuecPython（`fw.pac` 整包） | ⏸ 可回退 | 原来的 Python 环境（上不了任意画面，见 `docs/hardware.md` §6） |
 
 > **刷机只能在 Windows 上做**：进入下载模式后设备枚举成 `0525:a4a7`（CDC 形态），
@@ -77,6 +78,72 @@ py\python.exe qdisplay_app.py ..\..\win-display\qdisplay\qdisplay_native.bin --a
 **踩过的坑**：社区官方 `qflash.py` 走串口 BSL，在本机驱动上会卡死在 FDL2。
 本项目改用 `third_party/sprdflash` 的 native（libusb）路径，也就是上面的 `qdisplay_app.py`，稳定可用。
 
+## 1.5 改 BIN 必须重算头部 CRC32（重要）
+
+`qdisplay_native.bin` 是 **APP2 容器**，头部 32 字节里有一个**整文件 CRC32**（对比官方 0.3.0 / 0.3.1 两个 BIN 实测得出）：
+
+| 偏移 | 内容 |
+|---|---|
+| 0 | `2PPA`（u32 `0x41505032`） |
+| 4 | 文件长度（必须 = 实际字节数） |
+| **8** | **`crc32(整个文件，计算前 @8 视为 0)`** |
+| 12 | `0x00010000` |
+| 16 / 20 | `appimg_enter` / `appimg_exit` 地址（0.3.0: `0x60265c49`/`0x60265c71`） |
+| 24..32 | 0 |
+| 32..128 | 16 字节一条的装载描述符 `(kind, offset, size, address)` |
+
+**只改 1 个字节也必须重算 @8**，否则 loader 直接不启动 APP，表现为：
+
+- 刷写成功、读回校验也一致（字节确实写进去了）
+- 但 **APP 不跑**：屏黑、`COM15` 一个字节都不回（QDC1 探活失败）
+- **AT 口（COM7）正常**（`ATI` 能回应）——这是区分「APP 不启动」和「设备变砖」的关键
+
+连只改文件**末尾填充区**（0x25B10，不属于任何描述符）也会不启动，说明校验的是整个文件。
+`win-flash/flash/appimg.py` 就是干这个的：`fix()` 重算、`check()` 校验；
+`patch_waiting_page.py` / `patch_waiting_page_image.py` 都已接上；自己写新补丁脚本时 `import appimg` 后调用
+`appimg.fix(data)` 即可。
+
+> 踩坑记录：2026-11 第一次改 `panel_init`（`B4 80->60`）和改 MIPI 消隐时都“黑屏、APP 起不来”，
+> 当时归因于“寄存器改坏了/时序锁不住”，**实际都是没重算 CRC**。重算后这两类变体都能正常启动。
+
+## 1.6 换「等待连接」页图片（黑底纯白 → 不闪）
+
+等待页不是画出来的，而是固件里的一段 **LZ4 块**：渲染代码是
+
+```
+movw r0,#0x88fc ; movt r0,#0x6027   → waiting_page_lz4 = 0x602788fc
+mov.w r3,#0x1f4000                   → QD_FRAME_BYTES = 2048000
+movw r2,#0xc65f                      → sizeof(waiting_page_lz4) = 50783
+bl LZ4_decompress_safe               → 解压成 800×1280 BGR565 整帧
+```
+
+所以换页面 = ①在同样的 flash 偏移写一段新 LZ4 块（必须 ≤ 原长度）②改 `movw r2,#…` 的
+立即数 ③重算 APP2 的 CRC32（见 1.5）。**不用重编固件。**
+
+```bat
+cd win-flash\flash
+:: 生成页面（需要 pillow + lz4；只在这一步需要）
+::   --github "github.com/xxx/yyy" 想在第三行显示一个地址时用（默认空 = 显示 --tag 那句 WAITING FOR HOST）
+::   --logo 在地址前加 GitHub 猫咪图标（默认不加）
+::   --title/--sub/--tag 改文案；--aa 保留抗锯齿（会闪）；--levels K / --floor V 折中
+python make_waiting_page.py            :: → waiting_page/page.png + page.bgr565.lz4 + page.meta
+:: 刷机侧只依赖 stdlib：
+py\python.exe patch_waiting_page_image.py ..\..\win-display\qdisplay\qdisplay_native.bin qdisplay_native_wait.bin
+py\python.exe qdisplay_app.py qdisplay_native_wait.bin --auto
+:: 回退原厂页面：revert-firmware.cmd
+```
+
+设计原则：**只用纯黑（0x0000）/纯白（0xFFFF），并且关掉抗锯齿**——实测这颗屏白/黑/纯色不闪，
+中间灰会闪；抗锯齿的过渡像素就是中间灰。`make_waiting_page.py` 最后会阈值成 1-bit，
+产出的整帧只有 2 种颜色（`page.meta` 里可查）。
+
+实测（2026-11，本机）：原厂页 50783 B / 415 种颜色 → 新页 **11658 B / 2 种颜色**，
+刷入后 `VERIFY` 回读的 framebuffer 哈希 == 新页面 xxh32，屏上显示
+![新等待页](waiting-page-design.png)。
+
+> 注意：`HELLO flags=8`（`QD_WAITING_HASH`）是**编进固件的旧页面哈希**，换页面后它不会跟着变，
+> 别拿它当“当前屏上是不是等待页”的判据；要看就用 `VERIFY` 和 `page.meta` 里的 `xxh32` 比。
+
 ## 2. 恢复成 QuecPython
 
 ```bat
@@ -85,6 +152,23 @@ py\python.exe flash_at.py          :: 按 fw.pac 整包刷 + 格式化文件系�
 ```
 
 `win-flash/QPY_OCPU_V0004_EC600U_CNLB_FW.zip` 是同版本的官方 QuecPython 包（备份用）。
+
+## 2.5 关掉等待页每秒重绘（0.3.1+，可选）
+
+0.3.1 固件的「等待连接」页带 90 s 倒计时：`waiting_countdown()` 每秒把数字写进 framebuffer 后
+`submit_frame()`（2 MB cache clean + DSI 整帧提交），单缓冲下就是**每秒闪一下**。
+`patch_waiting_page.py` 只改 1 字节，让这个函数每次都提前 return：等待页只画一次，从此真静态
+（倒计时数字不再出现），90 s 适时关背光 / 按键调亮度都不受影响。
+
+```bat
+cd win-flash\flash
+py\python.exe patch_waiting_page.py qdisplay_native.bin    :: 官方 0.3.1 = 155456 B / sha256 4af5b2…
+py\python.exe qdisplay_app.py qdisplay_native_static.bin --auto
+:: 回退：把原来的 qdisplay_native.bin 再刷一次
+```
+
+脚本会先核 APP2 容器长度与字节指纹：本仓 0.3.0 的 154400 B bin **没有**倒计时那段代码，会直接报「不用打补丁」。
+如果屏上还闪，按 [`troubleshooting.md`](troubleshooting.md#屏闪) 的四步区分背光 PWM / 面板 / 供电。
 
 ## 3. 刷完怎么算成功
 

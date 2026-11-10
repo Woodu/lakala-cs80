@@ -147,22 +147,24 @@ def _read_entry(f, entry):
     return f.read(entry.size)
 
 
-# NV read-back chunk the vendor uses (0x3000 = 12288 bytes per READ_FLASH).
-NV_READ_CHUNK = 0x3000
+# 读回分块大小。注意：UIS8910 的 FDL2 会**忽略** READ_FLASH 里的 offset 字段，
+# 必须把偏移加进 addr 里（实测：addr+off 且 offset=0 才读得对，否则每个 chunk 都
+# 重复读第一块 —— 以前这里 offset 传 off，导致「读回校验不一致」误报 15 万字节）。
+NV_READ_CHUNK = 0x1000
 
 
 def _read_flash(io: 'p.SpdIO', addr: int, total: int, chunk: int = NV_READ_CHUNK) -> bytes:
-    """BSL READ_FLASH: read *total* bytes from logical *addr* in chunks.
+    """BSL READ_FLASH: read *total* bytes starting at *addr*.
 
-    Payload = addr(4 BE) | size(4 BE) | offset(4 BE); reply BSL_REP_READ_FLASH
-    (0x93) carries the data. A reusable primitive for reading back flash/NV.
+    Payload = addr(4 BE) | size(4 BE) | offset(4 BE)；offset 恒传 0，
+    分块靠 addr+off 递推（见上面的实测注释）。reply BSL_REP_READ_FLASH (0x93) 携带数据。
     """
     import struct as _s
     out = bytearray()
     off = 0
     while off < total:
         n = min(chunk, total - off)
-        io.send(p.BSL_CMD_READ_FLASH, _s.pack('>III', addr, n, off))
+        io.send(p.BSL_CMD_READ_FLASH, _s.pack('>III', addr + off, n, 0))
         rtype, rdata = io.recv(timeout=3.0)
         if rtype != p.BSL_REP_READ_FLASH:
             raise pdl.PdlError(f'READ_FLASH @ {addr:#x}+{off}: got {p.rep_name(rtype)}')

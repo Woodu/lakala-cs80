@@ -1,0 +1,16 @@
+{
+ "width": 800,
+ "height": 1280,
+ "raw_bytes": 2048000,
+ "lz4_bytes": 11658,
+ "xxh32": 2783202096,
+ "title": "等待连接",
+ "sub": "请在电脑上启动推屏程序",
+ "tag": "WAITING FOR HOST",
+ "aa": false,
+ "levels": 0,
+ "floor": 0,
+ "github": "",
+ "logo": false,
+ "color_count": 2
+}

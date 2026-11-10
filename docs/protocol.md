@@ -55,8 +55,12 @@
 1. **空 payload 的哈希不是 0**，是 `0x02cc5d05`。填 0 会被固件以 `status=3 BAD_HASH` 拒掉。
 2. **DATA 不要设 `DEFER_ACK(0x100)`**。不设 → 固件逐块回 ACK（天然限流）；设了 → 反而不回 ACK，主机卡死等回复。
 3. **`COMMIT` 必须 `flags=1`**，否则设备不会置 `committed_valid`，后续所有 `PATCH` 都回 `status=4 BAD_STATE`。
-4. **整帧 LZ4 用单块**：`BEGIN(raw=2048000)` + 一个 `DATA(flags=1, raw=2048000)` + `COMMIT`。
-   裸块路径单块上限是 508 KiB（`520192`），要发整帧必须走 LZ4。
+4. **`DATA` 的 `length`（压缩后字节数）也必须 ≤ 512000**，否则固件 `valid_header()` 直接判非法，
+   **连 ACK 都不回**（主机侧看起来是“超时”）。所以整帧 LZ4 不能赌“压得够小”：
+   按 **512000 字节一块**分别 LZ4、分别 `DATA(flags=1, offset=块偏移, raw_length=块长)`，
+   固件会逐块解到 framebuffer 对应偏移（`qdc1.c` 的 `push_full()` 就是这么做的）。
+   2026-11 实测：整帧单块 LZ4 在内容丰富（带走势图）时压出来 >512 KB → `no-ack-data` 死循环、
+   屏一直停在等待页；改成按块压缩后同一画面立刻恢复（整帧 ≈ 200 KB / 4 包）。
 
 ## 4. sidecar（`panel/qdc1.c`）stdin 协议
 

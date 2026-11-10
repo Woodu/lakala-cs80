@@ -72,6 +72,9 @@ EC600U-CN LCC 关键脚（完整图 `docs/ec600u-cn-pinout.png`）：
 - **亮度设成 100 时 PWM 完全停**（`bl_running=0, bl_edges=0`），屏最稳。
 - 另一层是固件**单缓冲 + 无 vblank 同步**的 DSI 提交：每次更新都可能出现轻微撕裂/瞬闪。
   内存放不下两块 2 MB framebuffer，因此无法双缓冲；只能靠减少提交次数来降低观感。
+- 还有一层是 **0.3.1 固件等待页的倒计时**：`waiting_countdown()` 每秒重画两位数字后整帧 `submit_frame()`，
+  等于每秒闪一下。0.3.0（本仓 bin）没这段代码，等待页只提交一次。
+  补丁与判断方法见 [`troubleshooting.md`](troubleshooting.md#屏闪) / [`firmware.md`](firmware.md)。
 
 ## 6. QuecPython 下的能力边界（历史实测，留档）
 
