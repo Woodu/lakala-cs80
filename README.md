@@ -18,7 +18,7 @@
 | 能力 | 说明 |
 |---|---|
 | 画布 | 5×8 网格（每格 160 px），组件拖拽/缩放/复制，多画布 tab 切换 |
-| 组件 | 时钟、时钟（表盘/LCD 数码管）、股票、K 线、加密、GitHub、天气、电脑指标、Agent、RunCat、倒计时、便签 |
+| 组件 | 时钟、时钟（表盘/LCD 数码管）、股票、K 线、加密、GitHub、天气、电脑指标、Agent、RunCat、RunCat 条、音乐、倒计时、便签、资讯、假期倒计时 |
 | 自定义页面 | 写一个 ES 模块直接画整屏（示例：自选股 + 分时图，见 `panel/web/pages/stock.js`） |
 | Agent 状态 | 自动扫描本机 Pi / Claude Code / Codex / DeepSeek Harness 的会话，列表按「运行中 → 等待 → 结束」排序，可逐条隐藏 |
 | 屏保 | 选视频（内置 `wallpaper.mp4`，也可用 `panel/add-screensaver.sh` 转自己的），手动播或锁屏自动播 |

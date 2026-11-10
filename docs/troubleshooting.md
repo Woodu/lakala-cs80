@@ -22,6 +22,29 @@
 
 `/api/status` 的 `session` 每次 sidecar 重连都会 +1；前端看到 `session` 变化会**整帧重推**。
 
+## 拔插 Type-C 后一直连不上（**macOS 专有，仍在定位**）
+
+**现象**：拔掉 Type-C 再插回，屏上停在「等待连接」页（不是黑屏，说明 APP 还在跑），Mac 侧
+`ioreg -p IOUSB` 里没有 `Android@`、kernel 日志也没有任何 USB 事件，`sidecar.log` 刷
+`打不开设备 (code=-1)`。拔一次 DC 12V 能恢复。
+
+**已排除「设备侧」**（2026-11 实测）：同一台设备、同一套接法（**DC 12V 一直插着**），
+在 Windows 上只拔插 Type-C 就能自动重连，不需要碰电源 → 模组在 DC 供电下是支持重新枚举的。
+所以这是 **macOS 侧**的事，客户端可以修。
+
+**当前怀疑（待验证）**：`qdc1.c` 的 `open_link()` 用 `USBDeviceOpen()`（**整机独占**）+ `SetConfiguration(dev,1)`
+去打开设备，而 attach 时 `AppleUSBCDCCompositeDevice` 也在抢同一个整机（日志里 Chrome / 豆包 / 夸克网盘
+也在抢，`openGated: provider is already opened for exclusive access`）。首次 attach 我们抢到了所以能用；
+重新 attach 时复合驱动先绑定，我们那套要么被拒、要么把配置重下一遍 → QDC1 那一半不再应答。
+Windows 上 Quectel 驱动只 open 一个 COM 口，不碰整机配置，所以没这个问题。
+
+**修法方向**：不碰整机（去掉 `USBDeviceOpen`/`SetConfiguration`），直接按 `bInterfaceNumber = 32`
+开接口，顺带不再和 Chrome/豆包/夸克抢整机。
+
+**已做的容忍**：`qdc1.c` 握手改成**最多重试 10 s**。刚插上线时固件要 2–5 s 才应答 QDC1，
+以前第一条 HELLO 超时就 `link_lost` → 整个 sidecar 白重启一轮（2026-11 实测：插上后枚举成功，
+但 `endpoint 0x8b` 三次读超时 → `no-ack-data`，重启后即正常）。
+
 ## 前端改了但屏上没变
 
 这是最容易误判的一类。屏上的内容来自**桌面 app 窗口里的页面**，而 app 用的是打包副本：
@@ -147,6 +170,33 @@ py\python.exe qdisplay_app.py qdisplay_native_static.bin --auto
 
 验证：修完后 `session` 保持 1 不涨、`last=patch ok=1 code=0`（每次 ~5 KB / ~100 ms）。
 日志里现在也会带状态码：`链路丢失 (no-ack-data, status=8)`（8 = 设备接收超时）。
+
+## 整帧推不上去：`no-ack-data status=8`，而且**同一画面必现**
+
+2026-11 又抓到一类（和上面「单块 >512 KB」不是同一个）：**固件 LZ4 解码遇到某些数据会直接回
+`status=8 TIMEOUT`**，跟画面大小无关。特征：
+
+- 同一个页面/组件，推帧必挂；换个页面（哪怕内容更复杂）就正常 → 看起来像"某个组件把设备搞坏了"
+- 日志固定同一块失败：`cs80: data fail block=0 raw=512000 clen=16864 status=8 mode=lz4`
+- sidecar 每次重启后又能握手、收 state、收 patch，只有那块 DATA 不过 → 设备没死，是解码器拒了这包
+- 压缩后反而更小（16 KB < 512 KB），所以不是长度超限
+
+**处理（已内置）**：`qdc1.c` 的 `push_full()` 现在失败会**原地重试**（不重启 sidecar），
+重试顺序改成 **LZ4 → 裸块（`DATA flags=0`，2 MB，~200 ms）→ 再 LZ4**，
+并且**记住踩坑的块**（原始像素哈希）+ 设 2 分钟「直接走裸块」窗口：
+
+```
+cs80: data fail block=0 raw=512000 clen=16864 status=8 mode=lz4   ← 第一次踩坑 ~3 s
+cs80: full frame retry 1 (raw=0, 3009ms)                          ← 这次之后走裸块
+```
+
+固件对这块不 ACK 时它自己的接收超时就是 3 s，所以第一次踩坑约 3 s，之后同类画面直接发裸块（~0.2 s）。
+只有裸块也失败才会 `link_lost`。
+
+**配套的拖动体验**：拖动/缩放组件时**不再推帧**（`editor.js` 只更新编辑器，松手时才 `markFull()` 推一帧）。
+以前拖一下要推十几帧、每帧还可能踩上面这个 3 s 的坑，屏上就会滞后好几秒。
+
+顺带：`host.py` 对"刚起来就死"的 sidecar 做了指数退避，设备类提示（"设备重连"）30 秒内只弹一次。
 
 ## 锁屏后画面卡成幻灯片
 
