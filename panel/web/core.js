@@ -23,8 +23,12 @@ export async function api(path, opts) {
   return type.includes('json') ? res.json() : res;
 }
 
-export async function postBinary(path, body) {
-  return api(path, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body });
+export async function postBinary(path, body, timeout = 0) {
+  const opts = { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body };
+  // 没有超时的 fetch 会永远挂住 pusher.busy（host 被设备 ACK 卡住时就是这样），
+  // 整页只能靠手刷。所有二进制推送都必须有上限。
+  if (timeout) opts.signal = AbortSignal.timeout(timeout);
+  return api(path, opts);
 }
 
 export async function postJson(path, obj) {

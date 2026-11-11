@@ -31,6 +31,7 @@ const FIELDS = {
 export const tiles = new Map();
 let grid = null;
 let hooks = {};
+let readOnly = false;   // kiosk：只渲染，不写布局、不触发拖拽
 let saveTimer = null;
 let customCanvas = null;
 let dragging = false;
@@ -119,6 +120,7 @@ export async function renderAll() {
 }
 
 function scheduleSave() {
+  if (readOnly) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     try {
@@ -254,15 +256,17 @@ function mountGrid() {
   // 每 200ms 推一帧会让屏上的画面滞后好几秒。
   grid.on('dragstart resizestart', () => {
     dragging = true;
-    if (hooks.onInteract) hooks.onInteract(true);
+    if (!readOnly && hooks.onInteract) hooks.onInteract(true);
   });
   grid.on('dragstop resizestop', () => {
     dragging = false;
+    if (readOnly) return;
     if (hooks.onInteract) hooks.onInteract(false);
     hooks.onLayoutChange && hooks.onLayoutChange();
   });
   grid.on('change', (_ev, nodes) => {
     (nodes || []).forEach(syncCellFromNode);
+    if (readOnly) return;   // kiosk 只负责画；别把布局写回去，也别 markFull
     scheduleSave();
     if (!interacting()) hooks.onLayoutChange && hooks.onLayoutChange();
     renderInspector();
@@ -289,6 +293,15 @@ async function mountActivePage() {
   if (page.type === 'grid') mountGrid();
   else mountCustom();
   renderInspector();
+}
+
+/** kiosk 用：重新拉布局并原地重建，不整页 reload。
+ * 整页 reload 会丢掉 pusher 的上一帧、重建整个 Chromium 页面（2~5 秒无帧），
+ * 而原地重建只需要重画组件，pusher 的 diff 会把变化的 tile（或必要时整帧）推上去。 */
+export async function reloadLayout() {
+  await loadLayout();
+  await mountActivePage();
+  renderTabs();
 }
 
 function syncCellFromNode(node) {
@@ -652,6 +665,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<
 // ---------------- 启动 ----------------
 export async function initEditor(h) {
   hooks = h || {};
+  readOnly = !!hooks.readOnly;
   await loadLayout();
   buildPalette();
   await mountActivePage();

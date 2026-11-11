@@ -1,7 +1,7 @@
 // 入口：把编辑器、数据调度、设备推送接起来
 import { H, W, api, postJson, saveLayout, state, startDataLoop, startStatusLoop } from './core.js';
 import { Pusher } from './pusher.js';
-import { applyZoom, deleteCurrentPage, initEditor, renderAll, renderTile, tiles, toast } from './editor.js';
+import { applyZoom, deleteCurrentPage, initEditor, renderAll, renderTile, reloadLayout, tiles, toast } from './editor.js';
 
 const el = (sel) => document.querySelector(sel);
 const pusher = new Pusher();
@@ -17,9 +17,15 @@ function paintStats(st) {
     pill.className = 'pill mono off';
     return;
   }
+  if (st.ok === false) {
+    // host 的队列满了（设备 ACK 慢）：这一帧没进队，下一轮会带上漏掉的 tile
+    pill.textContent = `设备积压 · ${st.ms}ms`;
+    pill.className = 'pill mono off';
+    return;
+  }
   const what = st.kind === 'full' ? '整帧' : st.kind === 'patch' ? `${st.tiles} tile` : '无变化';
   pill.textContent = `推送 ${what} · ${st.ms}ms`;
-  pill.className = 'pill mono' + (st.kind === 'none' ? '' : '');
+  pill.className = 'pill mono';
 }
 
 let saver = { files: [], file: '', autoLock: true, video: null, active: false, byLock: false };
@@ -36,6 +42,8 @@ function toastDevice(msg) {
 }
 let lastFullPush = 0;
 let loadedBuild = null;
+let usbWarned = false;
+let replugWarned = false;
 let reloadedFor = null;
 
 function paintDevice(st) {
@@ -50,6 +58,15 @@ function paintDevice(st) {
     }
   }
   const up = st.device === 'up';
+  const usb = st.usb;
+  if (up && st.needs_replug && !replugWarned) {
+    replugWarned = true;
+    toast('设备收不到推帧（固件接收卡死），请拔插一下 Type-C 复位', 'warn');
+  }
+  if (up && usb && usb.speed && usb.speed < 480 && !usbWarned) {
+    usbWarned = true;
+    toast(`USB ${usb.speed} Mbps（全速）：整帧要 1~2 秒，插到主机直连 USB 口可提速`, 'warn');
+  }
   const pill = el('#device-pill');
   pill.className = 'pill ' + (up ? 'on' : st.device === 'connecting' ? '' : 'off');
   el('#device-text').textContent =
@@ -83,7 +100,9 @@ function paintDevice(st) {
        特性位 <code>${typeof bits === 'number' ? '0x' + bits.toString(16) : '—'}</code> · 固件 <code>${fw}</code><br>
        背光 <code>${typeof b === 'number' ? b + '%' : '—'}</code> · PWM <code>${pwm}</code><br>
        喇叭 <code>${audioLabel}</code><br>
+       USB <code>${usb && usb.speed ? usb.speed + ' Mbps' : '—'}</code>${usb && usb.speed && usb.speed < 480 ? '（全速，整帧慢）' : ''} ·
        session <code>${st.session ?? '—'}</code> · 最近事件 <code>${side.event || '—'}</code>
+       ${st.needs_replug ? '<br><b>设备推帧持续失败：拔插 Type-C 重新枚举</b>' : ''}
        ${side.wire ? ` · ${side.wire} B` : ''}`
     : `未连上设备${st.reason ? '（' + st.reason + '）' : ''}<br>检查 Type-C 数据线 / 供电 / 官方上位机是否占着串口。<br>
        日志 <code>${(st.logs && st.logs.sidecar) || '~/.cs80_panel/sidecar.log'}</code>`;
@@ -101,11 +120,14 @@ async function boot() {
 
   const dataLoop = startDataLoop((w) => renderTile(w));
   await initEditor({
-    onLayoutChange: () => pusher.markFull(),
+    readOnly: KIOSK,   // kiosk 不写布局、不响应拖拽；布局变更由 reloadLayout 原地应用
+    onLayoutChange: () => {
+      if (!KIOSK) pusher.markFull();
+    },
     // 拖动/缩放期间屏上先不动，松手统一推一帧
     onInteract: (busy) => {
       pusher.interacting = busy;
-      if (!busy) pusher.markFull();
+      if (!busy && !KIOSK) pusher.markFull();
     },
     invalidateData: (id) => dataLoop.invalidate(id),
     invalidatePage: (id) => dataLoop.invalidatePage(id),
@@ -288,7 +310,9 @@ async function boot() {
   const tick = () => {
     if (!saver.active) renderAll();
     if (pusher.interacting) return; // 拖动中不推帧（见 editor.js）
-    if (Date.now() - lastFullPush > 60000 && !saver.active) {
+    // 60 s 一次的整帧兜底在 USB 全速（12 Mbps）下就是每分鐘冻结 1.5~2.5 s；
+    // patch 链本身有 base/target 哈希校验，只有出错时才会 markFull，所以改 10 分钟。
+    if (Date.now() - lastFullPush > 600000 && !saver.active) {
       pusher.markFull();
       lastFullPush = Date.now();
     }
@@ -303,17 +327,38 @@ async function boot() {
   setRate(200);
   setRateFn = setRate;
 
-  // kiosk：布局被编辑器改动后自动重载，保持“编辑器只改布局、后台负责上屏”
+  // kiosk：布局被编辑器改动后原地重建（不整页 reload），并给外部看门狗发心跳
   if (KIOSK) {
+    // 页面被浏览器冻结/崩溃时这个定时器会停 → panel/kiosk-guard.sh 会重启 Chromium。
+    // 注意：只让 kiosk 发，编辑器 tab 不能刷新它，否则 kiosk 冻结时会被掩盖。
+    const beat = () => fetch('/api/heartbeat', { method: 'POST' }).catch(() => {});
+    beat();
+    setInterval(beat, 5000);
     let sig = null;
+    let applying = false;
     setInterval(async () => {
+      if (applying) return;
       try {
         const l = await (await fetch('/api/layout', { cache: 'no-store' })).json();
         const s = JSON.stringify(l);
-        if (sig === null) sig = s;
-        else if (s !== sig) location.reload();
+        if (sig === null) {
+          sig = s;
+          return;
+        }
+        if (s === sig) return;
+        sig = s;
+        applying = true;
+        try {
+          await reloadLayout();
+          toast('布局已更新');
+        } catch (e) {
+          console.warn('apply layout failed, reload', e);
+          location.reload();
+        } finally {
+          applying = false;
+        }
       } catch (e) { /* host 重启中，下一轮再试 */ }
-    }, 2500);
+    }, 2000);
   }
 
   await initScreensaver();

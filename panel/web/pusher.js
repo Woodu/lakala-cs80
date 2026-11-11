@@ -3,6 +3,10 @@ import { CELL, H, ROWS, W, COLS, activePage, loadPageModule, state, postBinary }
 
 const TW = 32;
 const TH = 16;
+// 上限：patch 很小，5 s 足够；整帧 2 MB 在 USB 全速（12 Mbps）下本身就要 1.5~2.5 s，
+// 再算上固件 LZ4 重试，给 30 s。fetch 永远必须有上限，否则一次卡住 = 整页停摆。
+const PATCH_TIMEOUT = 5000;
+const FULL_TIMEOUT = 30000;
 
 export class Pusher {
   constructor() {
@@ -99,7 +103,7 @@ export class Pusher {
       rgb[k + 1] = rgba[j + 1];
       rgb[k + 2] = rgba[j + 2];
     }
-    await postBinary('/api/frame', rgb);
+    return postBinary('/api/frame', rgb, FULL_TIMEOUT);
   }
 
   async pushPatch(tiles, buf) {
@@ -117,7 +121,7 @@ export class Pusher {
         for (let k = 0; k < TW; k++, off += 2) dv.setUint16(off, buf[idx + k], true);
       }
     }
-    await postBinary('/api/patch', new Uint8Array(ab));
+    return postBinary('/api/patch', new Uint8Array(ab), PATCH_TIMEOUT);
   }
 
   async tick(tiles) {
@@ -128,23 +132,27 @@ export class Pusher {
       const img = this.ctx.getImageData(0, 0, W, H).data;
       const buf = this.toBgr565(img);
       const t0 = performance.now();
+      let res;
       if (this.fullNeeded || !this.prev) {
-        await this.pushFull(img);
-        this.fullNeeded = false;
-        this.stats = { wire: 0, ms: Math.round(performance.now() - t0), tiles: 0, kind: 'full' };
+        res = await this.pushFull(img);
+        if (res && res.ok !== false) this.fullNeeded = false;
+        this.stats = { wire: 0, ms: Math.round(performance.now() - t0), tiles: 0, kind: 'full', ok: res && res.ok };
       } else {
         const dirty = this.diff(this.prev, buf);
         if (dirty.length && dirty.length <= 120) {
-          await this.pushPatch(dirty, buf);
-          this.stats = { wire: 0, ms: Math.round(performance.now() - t0), tiles: dirty.length, kind: 'patch' };
+          res = await this.pushPatch(dirty, buf);
+          this.stats = { wire: 0, ms: Math.round(performance.now() - t0), tiles: dirty.length, kind: 'patch', ok: res && res.ok };
         } else if (dirty.length) {
-          await this.pushFull(img);
-          this.stats = { wire: 0, ms: Math.round(performance.now() - t0), tiles: 0, kind: 'full' };
+          res = await this.pushFull(img);
+          this.stats = { wire: 0, ms: Math.round(performance.now() - t0), tiles: 0, kind: 'full', ok: res && res.ok };
         } else {
           this.stats = { ...this.stats, ms: Math.round(performance.now() - t0) };
+          res = { ok: true };
         }
       }
-      this.prev = buf;
+      // 只有被 host 接收（入队）才推进 prev。入队失败/超时就保留旧 prev，
+      // 下一轮 diff 会把漏掉的 tile 一起带上（超过 120 个 tile 会自动走整帧）。
+      if (!res || res.ok !== false) this.prev = buf;
       if (this.onStats) this.onStats(this.stats);
     } catch (e) {
       if (this.onStats) this.onStats({ ...this.stats, kind: 'error', error: String(e) });

@@ -76,12 +76,22 @@ sudo systemctl enable --now cs80-panel cs80-kiosk
 ```
 
 - `cs80-panel`：`host.py --host 0.0.0.0 --port 8787`，局域网编辑器入口。
-- `cs80-kiosk`：headless Chromium 打开 `http://127.0.0.1:8787/?kiosk=1`，持续渲染推帧；
-  布局被编辑器改完后 2.5 秒内自动重载。Chromium 路径按本机 Playwright 安装位置写在 unit 里，换机器要改。
+- `cs80-kiosk`：`panel/kiosk-guard.sh` 拉起 Chromium headless 打开 `http://127.0.0.1:8787/?kiosk=1` 持续渲染推帧。
+  - 用 Playwright 的 **chrome-headless-shell**（不是完整 Chrome）：它没有窗口/遮挡，不会把页面当后台节流。
+  - unit 里仍带 `--disable-background-timer-throttling` 等参数，双保险。
+  - 页面每 5 秒 POST `/api/heartbeat`；guard 查 `/api/health` 的 `beat_age`，连续两次 >30 s 就重启 Chromium
+    （进程活着但页面被冻结时，systemd 的 `Restart=` 是发现不了的）。
+  - 编辑器改完布局后 kiosk **原地重建画布**（`reloadLayout()`），不再整页 reload，省掉 2~5 秒空档。
+  - Chromium 路径按本机 Playwright 安装位置写在脚本里，换机器改 `CS80_CHROME` 或脚本默认值。
 - Linux 上不带 `?kiosk=1` 的页面默认只编辑、不推帧（按钮显示“后台推送中”），避免和 kiosk 抢帧。
 - 需要 root，或给 `2c7c:0901` 加 udev 规则；首次 claim 会把接口 32 从 `option` 驱动摘下来（`ttyUSB6` 消失），属正常。
 - 界面无鉴权，`--host 0.0.0.0` 仅限可信内网；外网用 `ssh -L 8787:127.0.0.1:8787`。
 - Linux 下锁屏/显示器休眠联动不可用，其余功能（帧、patch、屏保、音频）一致。
+- **USB 速率**：`/api/status` 的 `usb.speed` 是 480 才是高速；如果是 12（全速），整帧 2 MB 要 1.5~2.5 s，
+  屏幕每次重连都会顿一下。优先直插主机 USB 口、换好线，别挂两层 HUB；本机就是重插一次后从 12 恢复到 480 的。
+- **推帧卡死**：host 的发送队列只有 4 条 + sidecar 每 patch 后 50 ms 限速，设备慢时宁可返回 `ok:false`
+  让前端下一轮合并重试，不会把几十条 patch 一口气灌给固件。连续 6 次推帧失败会在 UI 标
+  `needs_replug`：固件接收状态机卡死只能拔插 Type-C 重新枚举（不要用软件 USB reset，可能把固件 USB 功能复位死）。
 
 ## 已验证的现状
 
@@ -92,6 +102,8 @@ sudo systemctl enable --now cs80-panel cs80-kiosk
 | 传输 | macOS IOKit 接口 32 / Windows 厂商虚拟串口，QDC1 协议 |
 | 带宽 | 实测 **10.5 MB/s**（整帧裸 2 MB → 195 ms；LZ4 后 ~50 KB → 20 ms） |
 | 常态刷新 | 局部 patch **64 B / 1–2 ms**；屏保视频 12 fps（250 KB/帧、59 ms/帧） |
+| Linux 实测 | 重插后 480 Mbps：整帧 2 MB ≈ 0.2 s；曾枚举成 12 Mbps（全速，整帧 ≈ 1.7 s，`usb.speed` 可见） |
+| 已知固件坑 | 个别整帧/局部包 LZ4 解不动（3 s 接收超时，`status=8`）：patch 自动原地重试 3 次；整帧在全速链路上直接走裸块 |
 | 恢复 | `win-flash/flash/fw.pac` 可整包刷回 QuecPython |
 
 ## 目录

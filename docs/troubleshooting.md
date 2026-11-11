@@ -22,6 +22,31 @@
 
 `/api/status` 的 `session` 每次 sidecar 重连都会 +1；前端看到 `session` 变化会**整帧重推**。
 
+## 画面一卡一卡 / 几秒到几分钟不更新（Linux 无桌面）
+
+按这个顺序看，三条都踩过：
+
+1. **kiosk 页面被 Chromium 冻结/节流**。headless 页面也会被当成「后台/被遮挡」：先节流到 1 s，
+   5 分钟后降到 1 次/分钟，最后页面生命周期冻结。特征：`ps` 里 renderer CPU 0%，
+   `/api/status` 的 `last` 停在几分钟前，但进程都在。
+   - 修：kiosk 改用 Playwright 的 **chrome-headless-shell**（没有窗口/遮挡），unit 带
+     `--disable-background-timer-throttling --disable-backgrounding-occluded-windows
+     --disable-renderer-backgrounding --disable-features=IntensiveWakeUpThrottling`；
+     再加 `panel/kiosk-guard.sh`：页面每 5 s POST `/api/heartbeat`，`beat_age` 连续两次 >30 s 就重启 Chromium。
+2. **USB 全速（12 Mbps）**。`/api/status` 的 `usb.speed` 是 12 而不是 480 时，整帧 2 MB 要 1.5~2.5 s，
+   （本机实测：拔插一次 Type-C 后从 12 恢复到 480，所以先怀疑 HUB/线/枚举，不要先改代码）
+   60 秒一次的整帧兜底就是每分钟冻结一次。修：整帧兜底改 10 分钟；`CS80_RAW_FULL` 自动打开
+   （全速下裸块比「LZ4 等 3 s 超时 + 再发裸块」快）；更根本的是**直插主机 USB 口**，别挂两层 HUB。
+3. **host 的发送队列造成 patch 洪水**。设备偶尔 3 s 才回 ACK（固件 `status=8` 接收超时）；
+   如果把积压的几十条 patch 一口气灌回去，固件会连续超时，越积越多，最后回到「必须拔插」的状态。
+   - 修：host 队列只有 4 条、满了直接返回 `ok:false`（前端保留 `prev`，下一轮合并重试）；
+     sidecar 每成功一条 patch 后 sleep 50 ms；同一个 patch 失败（`status=8/5`）原地重试 3 次，
+     最终失败只回滚影子 framebuffer，不立刻推 2 MB 整帧。
+
+`/api/status` 出现 `needs_replug: true` 说明连续 6 次推帧都失败：**拔插 Type-C（或断一下 DC 12V）**。
+不要用软件 `USBDEVFS_RESET` / `authorized` 开关去复位 —— 实测可能把固件那半边 USB 功能复位死，
+设备直接从总线上消失，只能物理拔插。
+
 ## 拔插 Type-C 后一直连不上（**macOS 专有，仍在定位**）
 
 **现象**：拔掉 Type-C 再插回，屏上停在「等待连接」页（不是黑屏，说明 APP 还在跑），Mac 侧

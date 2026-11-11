@@ -16,6 +16,7 @@ import datetime
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import struct
@@ -45,6 +46,12 @@ WEB_LOG = os.path.join(CONF_DIR, "web.log")
 # 现在改成“记住用户选的值”：见 Device._bright_state()。
 #   CS80_BRIGHTNESS=100  → 强制锁定到 100（老行为，想要 PWM 完全不停时用）
 BRIGHTNESS_PIN = int(os.environ.get("CS80_BRIGHTNESS", "0") or 0)
+
+# kiosk 存活心跳：浏览器页面每 5 秒 POST 一次 /api/heartbeat。
+# 看门狗脚本（panel/kiosk-guard.sh）用它判断页面是否被浏览器冻结/崩了。
+BEAT = {"at": 0.0}
+PUSH = {"at": 0.0, "n": 0}
+_USB_INFO = {"at": 0.0, "value": None}
 
 GRID_PAGE = {
     "id": "main",
@@ -542,6 +549,7 @@ class Device:
         self.lock = threading.Lock()
         self.session = 0
         self.proc = None
+        self.fail_streak = 0     # 连续 ok=0 的帧/patch 数 → UI 提示拔插复位
         self.status = {"device": "connecting"}
         self.last = None
         self.last_event = 0.0
@@ -554,8 +562,39 @@ class Device:
         self.com = ""  # Windows：QDC1 数据串口（自动从注册表识别）
         self.audio_lock = threading.Lock()  # 上传/播放串行，避免两个请求交错
         self._audio_hash = {}  # (路径, 大小, mtime) → XXH32，重复播放不重算
+        # ---- 发往 sidecar 的写队列 ----
+        # 为什么不让 HTTP 线程直接写 sidecar 的 stdin：设备偶尔会 2~3 秒才回 ACK，
+        # 期间 sidecar 不读 stdin，管道写满后 HTTP 请求就会卡住 → 浏览器 pusher.busy
+        # 永远为 true，整条链路停摆。改成有界队列 + 单独写线程：HTTP 立刻返回，
+        # 积压的帧按序补发，设备慢只会让画面晚一点，不会把上层一起拖死。
+        # 只留很小的缓冲：设备正常 5 ms 回 ACK，4 条足够；队列一旦变大，
+        # sidecar 会在设备卡顿后把积压一口气灌进去 → 固件接收超时（status=8）雪崩。
+        self.q = queue.Queue(maxsize=4)
+        self._q_lock = threading.Lock()
+        self._q_bytes = 0
+        self.Q_MAX_BYTES = 6 << 20  # 一条整帧 3 MB + 若干 patch；再多就返回 ok:false
+        threading.Thread(target=self._writer, daemon=True).start()
         threading.Thread(target=self._supervise, daemon=True).start()
         threading.Thread(target=self._poll_state, daemon=True).start()
+
+    def _writer(self):
+        while True:
+            sess, payload = self.q.get()
+            with self._q_lock:
+                self._q_bytes -= len(payload)
+            # 换了 sidecar 会话：旧会话的帧（尤其是相对上一帧的 patch）已经没意义
+            if sess != self.session:
+                continue
+            proc = self.proc
+            if not proc or proc.poll() is not None or not proc.stdin:
+                continue
+            try:
+                proc.stdin.write(payload)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self.status = dict(self.status, device="down")
+            except Exception:
+                pass
 
     def _spawn(self):
         # 同时只能有一个 sidecar 持有 USB：先确认旧的已经退出，否则 Windows 上两个句柄
@@ -605,9 +644,16 @@ class Device:
                 print("CS80: 自动识别 QDC1 串口 = %s" % com, flush=True)
             self.com = com
             cmd += ["--com", com]
+        # USB 全速（12 Mbps）下整帧裸块（2 MB）比「LZ4 等 3 s 超时 + 再发裸块」快一倍，
+        # 让 sidecar 直接跳过 LZ4（只在 Linux/sysfs 能读到 speed 时做）。
+        env = None
+        if os.name != "nt":
+            info = usb_link_info()
+            if info and 0 < (info.get("speed") or 0) < 480:
+                env = dict(os.environ, CS80_RAW_FULL="1")
         try:
             self.proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, bufsize=0
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, bufsize=0, env=env
             )
         except FileNotFoundError:
             self.status = {"device": "no-sidecar"}
@@ -647,9 +693,21 @@ class Device:
             elif name == "exit":
                 self.status = dict(self.status, device="down")
             elif name in ("frame", "patch"):
+                extra = {"fw": ev["status"]} if "status" in ev else {}
                 self.status = dict(
-                    self.status, last=name, wait_ms=ev.get("ms"), wire=ev.get("wire"), ok=ev.get("ok"), code=ev.get("code")
+                    self.status, last=name, wait_ms=ev.get("ms"), wire=ev.get("wire"), ok=ev.get("ok"),
+                    code=ev.get("code"), **extra
                 )
+                # 连续收不到 patch：多半是固件接收状态机卡死（status=8），重发/整帧都没用，
+                # 只有断电/拔插 Type-C 重新枚举能清。这里只标记，让 UI 明确告诉人。
+                if ev.get("ok") == 1:
+                    self.fail_streak = 0
+                    if self.status.get("needs_replug"):
+                        self.status = dict(self.status, needs_replug=False)
+                else:
+                    self.fail_streak += 1
+                    if self.fail_streak >= 6:
+                        self.status = dict(self.status, needs_replug=True)
             elif name in ("brightness", "power", "state"):
                 self.status = dict(self.status, **{name: {k: v for k, v in ev.items() if k != "event"}})
                 if name == "state":
@@ -718,8 +776,10 @@ class Device:
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 5.0)
                 else:
-                    # 等它握手成功（ready）或直接退出；没 ready 就退避重试，避免疯狂重枚举 USB
-                    deadline = time.time() + 3
+                    # 等它握手成功（ready）或直接退出；没 ready 就退避重试，避免疯狂重枚举 USB。
+                    # 注意 sidecar 自己的 HELLO 重试预算是 10 s 量级（刚上电/刚 USB reset 后
+                    # 固件 USB 初始化要几秒），这里杀太快会让它永远来不及 ready。
+                    deadline = time.time() + 15
                     while time.time() < deadline and self.proc is not None and self.status.get("device") != "up":
                         time.sleep(0.1)
                     if self.status.get("device") == "up":
@@ -755,18 +815,22 @@ class Device:
             proc.kill()
         return True
 
-    def send(self, payload):
-        with self.lock:
-            proc = self.proc
-            if not proc or proc.poll() is not None or not proc.stdin:
+    def send(self, payload, timeout=0.5):
+        """入队即返回（不是「已写进 USB」）。队列满/设备不在线才返回 False。"""
+        if self.status.get("device") != "up":
+            return False
+        n = len(payload)
+        with self._q_lock:
+            if self.q.full() or self._q_bytes + n > self.Q_MAX_BYTES:
                 return False
-            try:
-                proc.stdin.write(payload)
-                proc.stdin.flush()
-                return True
-            except (BrokenPipeError, OSError):
-                self.status = dict(self.status, device="down")
-                return False
+            self._q_bytes += n
+        try:
+            self.q.put_nowait((self.session, payload))
+            return True
+        except queue.Full:
+            with self._q_lock:
+                self._q_bytes -= n
+            return False
 
     def control(self, cmd, arg=0):
         return self.send(b"\x03" + bytes([cmd, arg]))
@@ -2151,6 +2215,38 @@ def solid_bgr565(rgb):
     return value.to_bytes(2, "little") * (800 * 1280)
 
 
+def usb_link_info():
+    """Linux：读 sysfs 拿 QDC1 设备的 USB 速率（480=高速，12=全速）。
+    整帧 2 MB 在 12 Mbps 上要 ~1.5 s，是「推整帧时屏上冻结两秒」的直接原因。"""
+    now = time.time()
+    if now - _USB_INFO["at"] < 10 and _USB_INFO["value"] is not None:
+        return _USB_INFO["value"]
+    out = None
+    if sys.platform.startswith("linux"):
+        try:
+            for name in os.listdir("/sys/bus/usb/devices"):
+                base = os.path.join("/sys/bus/usb/devices", name)
+
+                def rd(key):
+                    try:
+                        with open(os.path.join(base, key)) as f:
+                            return f.read().strip()
+                    except OSError:
+                        return ""
+
+                if rd("idVendor") == "2c7c" and rd("idProduct") == "0901":
+                    try:
+                        speed = float(rd("speed"))
+                    except ValueError:
+                        speed = 0.0
+                    out = {"speed": speed, "path": name}
+                    break
+        except OSError:
+            pass
+    _USB_INFO.update(at=now, value=out)
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     device = None
     protocol_version = "HTTP/1.1"
@@ -2178,8 +2274,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             return self._send(200, dict(self.device.status, session=self.device.session, layout=load_layout(),
                                        sidecar=self.device.last, build=web_build(),
-                                       screen=dict(SCREEN_STATE),
+                                       screen=dict(SCREEN_STATE), usb=usb_link_info(),
+                                       beat_age=(round(time.time() - BEAT["at"], 1) if BEAT["at"] else None),
                                        logs={"sidecar": SIDECAR_LOG, "web": WEB_LOG}))
+        if path == "/api/health":
+            now = time.time()
+            return self._send(200, {
+                "beat_age": round(now - BEAT["at"], 1) if BEAT["at"] else None,
+                "push_age": round(now - PUSH["at"], 1) if PUSH["at"] else None,
+                "device": self.device.status.get("device"),
+            })
         if path == "/api/data/weather":
             city = (qs.get("city") or ["北京"])[0]
             return self._send(200, CACHE.get("wx:" + city, 900, lambda: weather(city)))
@@ -2308,16 +2412,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, dict(cfg, ok=True))
             save_saver_cfg(cfg)
             return self._send(200, dict(cfg, ok=True))
+        if url.path == "/api/heartbeat":
+            self.rfile.read(n)  # keep-alive：body 必须读掉
+            BEAT["at"] = time.time()
+            return self._send(200, {"ok": True})
         if url.path == "/api/frame":
             body = self.rfile.read(n)
-            if len(body) != 800 * 1280 * 3:
+            if len(body) != n or len(body) != 800 * 1280 * 3:
                 return self._send(400, {"error": "frame must be %d bytes, got %d" % (800 * 1280 * 3, len(body))})
             ok = self.device.send(b"\x01" + body)
-            return self._send(200, {"ok": ok})
+            PUSH["at"] = time.time()
+            if ok:
+                PUSH["n"] += 1
+            return self._send(200, {"ok": ok, "queued": ok})
         if url.path == "/api/patch":
             body = self.rfile.read(n)
+            # 浏览器 reload / fetch 超时会在上传中途断开，rfile.read(n) 只拿到半截 body。
+            # 把半截 patch 转给 sidecar 会永久错位它的 stdin 消息流（下一帧读到 0xe3 之类
+            # 的像素字节当消息类型 → exit → 反复重启）。这里只放行结构完整的 patch。
+            bad = len(body) != n or len(body) < 4
+            if not bad:
+                cnt = struct.unpack_from("<I", body, 0)[0]
+                if cnt == 0 or cnt > 495 or 4 + cnt * 1028 != len(body):
+                    bad = True
+            if bad:
+                return self._send(400, {"error": "bad patch body"})
             ok = self.device.send(b"\x02" + body)
-            return self._send(200, {"ok": ok})
+            PUSH["at"] = time.time()
+            if ok:
+                PUSH["n"] += 1
+            return self._send(200, {"ok": ok, "queued": ok})
         if url.path == "/api/device/pattern":
             # 把整屏刷成一种纯色：闪不闪、闪哪种颜色，就能把固件重绘 / 背光 PWM / 面板分开
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -2349,6 +2473,8 @@ class Handler(BaseHTTPRequestHandler):
             # 浏览器 POST 原始文件字节；?name=foo.wav 给扩展名，?play=1 传完就播。
             # 非 MP3 先转码（固件只认 MP3）。
             data = self.rfile.read(n)
+            if len(data) != n:
+                return self._send(400, {"error": "truncated upload"})
             if not data:
                 return self._send(400, {"error": "empty body"})
             if len(data) > AUDIO_IN_MAX:

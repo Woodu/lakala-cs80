@@ -499,7 +499,8 @@ static int wait_ack(link_t *l, uint32_t seq, int tries) {
    * ACK（表现为 no-ack-data，设备停在等待页）。现在累积到缓冲区里逐字节找完整帧。 */
   static uint8_t acc[1024];
   static size_t have;
-  have = 0;
+  /* 不要把 have 清零：上一次可能在 800 ms 内只读到半条 ACK（USB 会把 56 B 拆成
+   * 32+24 两次短包），丢掉它就得再等一整个超时。中间的不匹配字节会在下面被滑动跳过。 */
   uint8_t buf[256];
   for (int i = 0; i < tries && !stop; i++) {
     uint32_t len = sizeof buf;
@@ -529,7 +530,10 @@ static int wait_ack(link_t *l, uint32_t seq, int tries) {
       memmove(acc, acc + off, have);
     }
   }
-  have = 0;
+  if (have > 55) {  /* 只留可能是半条 ACK 的尾巴，其余是垃圾 */
+    memmove(acc, acc + have - 55, 55);
+    have = 55;
+  }
   return -1;
 }
 /* ---------- 帧状态：本地影子 framebuffer，用于算 patch 的 base/target 哈希 ---------- */
@@ -626,8 +630,10 @@ static int push_full_once(link_t *l, int raw_mode, uint32_t *wire, uint32_t *ms)
  * 裸块能绕过去；只有连裸块都不行才真正判定链路丢失。 */
 static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
   /* 尝试顺序：LZ4（快）→ 裸块（一定能过，2 MB，~200 ms）→ 再 LZ4（万一裸块反而过不去）。
-   * 固件对这块不 ACK 时，它自己的接收超时是 3 s，所以「第一次踩坑」大约 3 s，之后走裸块就快了。 */
-  int skip_lz4 = now_ms() < lz4_bad_until;
+   * 固件对这块不 ACK 时，它自己的接收超时是 3 s，所以「第一次踩坑」大约 3 s，之后走裸块就快了。
+   * USB 全速（12 Mbps）下 2 MB 裸块 ≈1.7 s，而 LZ4 踩坑要 3 s 超时 + 再发 1.7 s；
+   * host 检测到 speed<480 会设 CS80_RAW_FULL=1，直接走裸块。 */
+  int skip_lz4 = now_ms() < lz4_bad_until || getenv("CS80_RAW_FULL") != NULL;
   for (int attempt = 0; attempt < 3; attempt++) {
     int raw_mode = attempt == 1 ? 1 : (attempt == 0 ? skip_lz4 : 0);
     double t_attempt = now_ms();
@@ -645,6 +651,7 @@ static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
 static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t *wire, uint32_t *ms) {
   static uint8_t *raw;
   static char *comp;
+  static uint8_t *bak;  /* 影子回滚用：失败时把 tile 原来的像素放回去 */
   static int cap;
   if (!fbuf_valid) return -1;
   uint32_t raw_len = 8 + count * (TILE_BYTES + 8);
@@ -654,7 +661,8 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
     cap = LZ4_compressBound(BLOCK_BYTES);
     raw = malloc(BLOCK_BYTES);
     comp = malloc(cap);
-    if (!raw || !comp) return -3;
+    bak = malloc((size_t)MAX_TILES * TILE_BYTES);
+    if (!raw || !comp || !bak) return -3;
   }
   if (debug) fprintf(stderr, "patch: count=%u fbuf_valid=%d hash=%#x\n", count, fbuf_valid, fbuf_hash);
   wr32(raw, 0); /* target 哈希稍后填 */
@@ -672,9 +680,12 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
     out[6] = TILE_H;
     out[7] = 0;
     memcpy(out + 8, t + 4, TILE_BYTES);
-    /* 同步到影子 framebuffer */
-    for (uint32_t row = 0; row < TILE_H; row++)
-      memcpy((uint8_t *)fbuf + ((y + row) * WIDTH + x) * 2u, t + 4 + row * TILE_W * 2u, TILE_W * 2u);
+    /* 同步到影子 framebuffer（先备份原像素，失败时回滚） */
+    for (uint32_t row = 0; row < TILE_H; row++) {
+      uint8_t *dst = (uint8_t *)fbuf + ((y + row) * WIDTH + x) * 2u;
+      memcpy(bak + i * TILE_BYTES + row * TILE_W * 2u, dst, TILE_W * 2u);
+      memcpy(dst, t + 4 + row * TILE_W * 2u, TILE_W * 2u);
+    }
     out += 8 + TILE_BYTES;
   }
   uint32_t target = xxh32(fbuf, FRAME_BYTES);
@@ -683,14 +694,47 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   double t0 = now_ms();
   int clen = LZ4_compress_default((const char *)raw, comp, (int)raw_len, cap);
   if (clen <= 0) return -5;
-  if (send_cmd(l, QD_PATCH, 1, fbuf_hash, raw_len, comp, (uint32_t)clen)) link_lost("write-patch");
-  if (wait_ack(l, l->seq, ACK_TRIES)) link_lost("no-ack-patch");
-  if (debug) fprintf(stderr, "patch ack: status=%u detail=%#x\n", reply_body[0], reply_body[5]);
-  if (reply_body[0]) return -7;
-  fbuf_hash = target;
+  /* 设备偶尔会「收完命令但 3 s 才回 status=8（接收超时）」——固件那一刻在忙绘制。
+   * 对同一个 patch 原地重试（base 哈希没变，设备也没应用），比立刻让前端推 2 MB 整帧便宜得多。 */
+  int rc = -7, attempt = 0;
+  for (; attempt < 3; attempt++) {
+    if (attempt) sleep_ms(250);
+    if (send_cmd(l, QD_PATCH, 1, fbuf_hash, raw_len, comp, (uint32_t)clen)) link_lost("write-patch");
+    if (wait_ack(l, l->seq, ACK_TRIES)) link_lost("no-ack-patch");
+    if (debug)
+      fprintf(stderr, "patch ack: try=%d status=%u detail=%#x\n", attempt, reply_body[0], reply_body[5]);
+    if (reply_body[0] == 0) {
+      rc = 0;
+      break;
+    }
+    /* 4=base 哈希不对 / 3=哈希错：重试也没用，直接交给整帧 */
+    if (reply_body[0] != 8 && reply_body[0] != 5) break;
+    fprintf(stderr, "cs80: patch retry %d (status=%u tiles=%u)\n", attempt + 1, reply_body[0], count);
+  }
   *wire = (uint32_t)clen + 32;
   *ms = (uint32_t)(now_ms() - t0);
-  return 0;
+  if (*ms > 500)  /* 设备偶尔 2~3 s 才回 ACK：留证据（4=base 哈希不对，8=接收超时） */
+    fprintf(stderr, "cs80: slow patch ack %ums status=%u tiles=%u\n", *ms, reply_body[0], count);
+  if (rc == 0) {
+    if (reply_body[5] && reply_body[5] != target) {
+      /* 设备上的 framebuffer 和设备自己算的哈希对不上：影子已不可信，整帧重来 */
+      fprintf(stderr, "cs80: patch hash mismatch device=%#x shadow=%#x\n", reply_body[5], target);
+      fbuf_valid = 0;
+      return -8;
+    }
+    fbuf_hash = target;
+    return 0;
+  }
+  /* 失败：把刚才写进影子的 tile 回滚，保持 fbuf_valid=1。
+   * 这样浏览器保留 prev 后重试同一块 patch 即可，不必每失败一次就推 2 MB 整帧。 */
+  for (uint32_t i = 0; i < count; i++) {
+    const uint8_t *t = tiles + i * TILE_MSG;
+    uint16_t x = (uint16_t)(t[0] | t[1] << 8), y = (uint16_t)(t[2] | t[3] << 8);
+    for (uint32_t row = 0; row < TILE_H; row++)
+      memcpy((uint8_t *)fbuf + ((y + row) * WIDTH + x) * 2u, bak + i * TILE_BYTES + row * TILE_W * 2u,
+             TILE_W * 2u);
+  }
+  return -7;
 }
 
 /* ---------- 音频：固件 type 7（控制）/ 8（MP3 分块）/ 9（实时 PCM）----------
@@ -894,9 +938,13 @@ int main(int argc, char **argv) {
       if (read_exact(tiles, (size_t)count * TILE_MSG)) break;
       uint32_t wire = 0, ms = 0;
       int r = push_patch(&l, tiles, count, &wire, &ms);
-      json("{\"event\":\"patch\",\"ok\":%d,\"code\":%d,\"tiles\":%u,\"wire\":%u,\"ms\":%u}", r == 0, r, count,
-           wire, ms);
+      json("{\"event\":\"patch\",\"ok\":%d,\"code\":%d,\"status\":%u,\"tiles\":%u,\"wire\":%u,\"ms\":%u}", r == 0, r,
+           reply_body[0], count, wire, ms);
       if (r == -1) json("{\"event\":\"hint\",\"msg\":\"need full frame first\"}");
+      /* 限速：给别人家的固件留出绘制时间。正常情况下浏览器 5 Hz（200 ms 一条）
+       * 碰不到这个下限；但设备卡顿积压时，这里能防止 sidecar 一口气把几十条 patch
+       * 灌进去 → 固件接收超时（status=8）→ 越积越多。 */
+      if (r == 0) sleep_ms(50);
     } else if (type == 0x03) { /* 控屏 */
       uint8_t cmd = 0, arg = 0;
       if (read_exact(&cmd, 1) || read_exact(&arg, 1)) break;
