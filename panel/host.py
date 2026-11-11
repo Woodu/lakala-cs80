@@ -2425,6 +2425,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default=os.environ.get("CS80_HOST", "127.0.0.1"),
+                    help="监听地址；局域网访问用 0.0.0.0（无鉴权，注意网络环境）")
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--no-device", action="store_true", help="只跑编辑器，不连屏（设计布局用）")
     ap.add_argument("--com", help="Windows：指定设备数据串口，如 COM15")
@@ -2454,8 +2456,8 @@ def main():
     Handler.device = device
     global SAVER
     SAVER = Saver(device)
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print("CS80 面板编辑器: http://127.0.0.1:%d  (layout: %s)" % (args.port, LAYOUT))
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    print("CS80 面板编辑器: http://%s:%d  (layout: %s)" % (args.host, args.port, LAYOUT))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

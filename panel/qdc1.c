@@ -227,6 +227,12 @@ static int open_link(link_t *l, int iface_number) {
     return -4;
   }
   fprintf(stderr, "cs80: %s if%d ep_out=0x%02x ep_in=0x%02x\n", path, iface_number, l->ep_out, l->ep_in);
+  /* 清掉上一轮进程遗留的迟到 ACK，避免新会话第一个命令读到旧 seq。 */
+  for (int i = 0; i < 32; i++) {
+    uint8_t junk[256];
+    struct usbdevfs_bulktransfer t = { .ep = l->ep_in, .len = sizeof junk, .timeout = 20, .data = junk };
+    if (ioctl(fd, USBDEVFS_BULK, &t) < 0) break;
+  }
   return 0;
 }
 
@@ -497,7 +503,8 @@ static int wait_ack(link_t *l, uint32_t seq, int tries) {
   uint8_t buf[256];
   for (int i = 0; i < tries && !stop; i++) {
     uint32_t len = sizeof buf;
-    if (raw_read(l, buf, &len, 400) == 0 && len) {
+    if (raw_read(l, buf, &len, 800) == 0 && len) {
+      if (debug) fprintf(stderr, "ack read: %u bytes\n", len);
       if (have + len > sizeof acc) have = 0;  /* 异常数据，重来 */
       memcpy(acc + have, buf, len);
       have += len;
@@ -506,6 +513,7 @@ static int wait_ack(link_t *l, uint32_t seq, int tries) {
     while (have - off >= 56) {
       uint8_t *p = acc + off;
       if (rd32(p) == MAGIC && p[5] == QD_ACK && rd32(p + 28) == xxh32(p, 28)) {
+        if (debug) fprintf(stderr, "ack frame: seq=%u expect=%u status=%u\n", rd32(p + 8), seq, rd32(p + 32));
         if (rd32(p + 8) == seq) {
           for (int k = 0; k < 6; k++) reply_body[k] = rd32(p + 32 + 4 * k);
           have = 0;
