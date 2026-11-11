@@ -2132,6 +2132,34 @@ def _mac_cpu_percent():
 
 
 
+_LINUX_CPU = {"ticks": None}
+
+
+def _linux_cpu_percent():
+    """Linux：/proc/stat 的 jiffies 差分（idle+iowait 之外都算忙）。
+    和 top/htop 口径一致；loadavg/ncpu 是负载均值，不是占用率（见 docs/dead-ends.md）。
+    第一次调用没有基准，返回 None，由调用方退回 loadavg。"""
+    try:
+        with open("/proc/stat") as f:
+            parts = f.readline().split()
+        vals = [int(x) for x in parts[1:]]
+        if len(vals) < 4:
+            return None
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
+        total = sum(vals)
+    except Exception:
+        return None
+    prev = _LINUX_CPU["ticks"]
+    _LINUX_CPU["ticks"] = (total, idle)
+    if not prev or total <= prev[0]:
+        return None
+    dt = total - prev[0]
+    di = idle - prev[1]
+    if dt <= 0:
+        return None
+    return max(0.0, min(1.0, 1.0 - di / dt))
+
+
 def _windows_metrics():
     """Windows 的 CPU/内存（GetSystemTimes + GlobalMemoryStatusEx，不装第三方包）。"""
     import ctypes
@@ -2304,18 +2332,16 @@ def system_metrics():
     if sys.platform == "darwin":
         cpu = _mac_cpu_percent()
     else:
-        cpu = 0.0
-        try:
-            psutil = _opt("psutil")
-            if psutil is not None:
-                cpu = psutil.cpu_percent(interval=None) / 100.0
-            else:
+        cpu = _linux_cpu_percent()
+        if cpu is None:  # 第一次采样/取不到 /proc/stat 时退回 loadavg
+            try:
                 cpu = min(1.0, os.getloadavg()[0] / max(1, os.cpu_count() or 1))
-        except Exception:
-            pass
+            except Exception:
+                cpu = 0.0
     mem, total = 0.0, 0.0
     try:
         if os.path.exists("/usr/bin/vm_stat"):
+            # macOS
             out = subprocess.check_output(["vm_stat"], text=True)
             m = re.search(r"page size of (\d+) bytes", out)
             page = int(m.group(1)) if m else 4096
@@ -2326,6 +2352,21 @@ def system_metrics():
                     used += int(val.strip().rstrip(".") or 0)
             total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip()) / 2**30
             mem = used * page / 2**30
+        elif os.path.exists("/proc/meminfo"):
+            # Linux：used = MemTotal - MemAvailable，和 free/htop 的 used 一致
+            info = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, _, v = line.partition(":")
+                    try:
+                        info[k.strip()] = int(v.strip().split()[0])
+                    except (ValueError, IndexError):
+                        pass
+            total = info.get("MemTotal", 0) / 1048576.0
+            avail = info.get("MemAvailable")
+            if avail is None:
+                avail = info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)
+            mem = (info.get("MemTotal", 0) - avail) / 1048576.0
     except Exception:
         pass
     up, down = net_rates()
@@ -2754,6 +2795,10 @@ def main():
         _windows_metrics()
         time.sleep(0.12)
         _windows_metrics()
+    else:  # Linux：/proc/stat 差分也需要两次采样
+        _linux_cpu_percent()
+        time.sleep(0.12)
+        _linux_cpu_percent()
     threading.Thread(target=_screen_watch, daemon=True).start()
     device = (
         Device()
