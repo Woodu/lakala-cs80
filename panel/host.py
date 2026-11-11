@@ -1245,22 +1245,46 @@ def minute(symbol):
     }
 
 
+# 每只股票最后一次成功的结果：(时间, item)。行情接口偶发空数据/超时时用它顶一下，
+# 免得组件上一秒还有分时、下一秒就变成「无分时」。
+_PF_LAST = {}
+PF_KEEP = 1800  # 秒：超过这个时间的旧分时不再复用（避免拿昨天的曲线当今天）
+
+
+def _pf_item(sym):
+    prev = _PF_LAST.get(sym)
+    try:
+        q = stock(sym)
+        if not q.get("prev") and not q.get("price"):  # 空快照（开盘前/接口抽风）当失败处理
+            raise RuntimeError("空快照")
+    except Exception:
+        if prev:
+            return dict(prev[1], stale=True)
+        return {"symbol": sym, "error": "行情获取失败", "stale": True}
+    try:
+        m = minute(sym)
+        q["points"] = m["points"]
+        q["preClose"] = m.get("preClose")
+    except Exception:
+        # 分时拿不到就沿用上一份（有 & 不太旧），至少别让曲线整块消失
+        stale = False
+        if prev and prev[1].get("points") and time.time() - prev[0] < PF_KEEP:
+            q["points"] = prev[1]["points"]
+            q["preClose"] = prev[1].get("preClose", q.get("prev"))
+            stale = True
+        else:
+            q["points"] = []
+            q["preClose"] = q.get("preClose") or q.get("prev")
+        q["stale"] = stale
+    _PF_LAST[sym] = (time.time(), q)
+    return q
+
+
 def portfolio(symbols):
-    """自选股：一次给「快照 + 分时」，给自定义页面用"""
-    items = []
-    for sym in [x.strip() for x in str(symbols).split(",") if x.strip()][:8]:
-        try:
-            q = stock(sym)
-            try:
-                m = minute(sym)
-                q["points"] = m["points"]
-                q["preClose"] = m["preClose"]
-            except Exception:
-                q["points"] = []
-            items.append(q)
-        except Exception as e:
-            items.append({"symbol": sym, "error": str(e)})
-    return {"items": items, "source": "mixed"}
+    """自选股：一次给「快照 + 分时」，给自定义页面和股票组件用"""
+    items = [_pf_item(sym) for sym in [x.strip() for x in str(symbols).split(",") if x.strip()][:8]]
+    return {"items": items, "source": "mixed",
+            "stale": any(it.get("stale") for it in items)}
 
 
 # ---------- 行情补充源（加密 / GitHub）----------

@@ -499,8 +499,9 @@ export function stockRow(ctx, r, item, t, opts = {}) {
     ctx.fillStyle = t.cardHi;
     ctx.fill();
   }
+  const hasQuote = item.price != null && item.prev != null;
   const up = (item.pct ?? 0) >= 0;
-  const color = up ? t.up : t.down;
+  const color = hasQuote ? (up ? t.up : t.down) : t.fg4;
 
   // 名称 + 代码
   const nameW = Math.min(r.w * 0.36, Math.max(96, r.w * 0.3));
@@ -515,8 +516,9 @@ export function stockRow(ctx, r, item, t, opts = {}) {
 
   // 价格 + 涨跌幅（右侧）
   const priceW = Math.min(r.w * 0.26, Math.max(84, r.w * 0.22));
-  const priceTxt = Number(item.price ?? 0).toFixed(2);
-  const pctTxt = `${up ? '+' : ''}${Number(item.pct ?? 0).toFixed(2)}%`;
+  // 没拿到快照时画占位符，别显示 0.00 让人以为跌停了
+  const priceTxt = hasQuote ? Number(item.price).toFixed(2) : '—';
+  const pctTxt = hasQuote ? `${up ? '+' : ''}${Number(item.pct ?? 0).toFixed(2)}%` : '';
   ctx.textAlign = 'right';
   ctx.fillStyle = color;
   ctx.font = font(fitFont(ctx, priceTxt, priceW, Math.min(r.h * 0.3, 34), 400, true), 400, true);
