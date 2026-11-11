@@ -11,6 +11,7 @@
 | **`appimg.py`** | APP2 容器头 `u32@8 = crc32(整文件)` 的重算/校验 —— **手改任何字节后必须重算**，否则 loader 不启动 APP（屏黑、COM15 无应答、AT 口正常） |
 | **`reset_download.py`** | 设备卡在下载模式（`PDL connect` 超时，其实 FDL2 还在跑）时走 BSL 发 `NORMAL_RESET` 重启，不用拔插 |
 | **`flash_at.py`** | 按 `fw.pac` **整包刷 QuecPython**（含格式化文件系统 + 重建 NV）。用于「恢复成 Python 环境」 |
+| **`dump_flash.py`** | 整片 flash 备份 / 裸写回滚（默认 `0x60000000` 起 8 MiB）。降级基带、换固件前必做；`--restore` 把 dump 原样写回。详见 [`../../docs/firmware.md`](../../docs/firmware.md) §0.5 |
 
 ---
 
@@ -91,6 +92,8 @@ py\python.exe flash_at.py           :: 整包刷 fw.pac（会问 y）
 | 用 `native._read_flash()` 默认 chunk 校验 | 从 `0x3000` 起全是差异，误判「写失败」 | 该函数默认 chunk 太大（0x3000）读回不可靠；校验要用 **1 KB / 4 KB 分块** |
 | 设备卡在「下载模式但不收数据」 | 写超时 / `ClearCommError` | 断电重上电（DC 和 Type-C 都拔），回正常工作态再走一遍 |
 | 便携 Python 的 `sys.path` | 同目录模块 import 失败 | embed 版 `_pth` 不含脚本目录；脚本里 `sys.path.insert(0, ".")` |
+| `READ_FLASH` 大 chunk | 回一个 0 字节的应答，不报错 → dump 出 0 字节文件 | chunk 不超过 `0x8000`，并且每条读都校验返回长度（`dump_flash.py` 已做） |
+| 刷机时 AT 口“无响应” | `PermissionError(13, '拒绝访问')` / `Cannot configure port` | 桌面壳 `cs80-panel` 开着时它的 `qdc1.exe --probe` 会抢 COM 口，刷机前先退出 |
 | 在 git-bash 里传 Windows 路径 | `FileNotFoundError: /tmp/...` | 用 `cygpath -w` 或直接给 `C:/...` 形式 |
 
 ---
@@ -104,6 +107,7 @@ py\python.exe flash_at.py           :: 整包刷 fw.pac（会问 y）
 | `appimg.py` | APP2 头部 `u32@8 = crc32(整文件)`，手改字节后必须重算 |
 | `reset_download.py` | 卡下载模式时用 BSL `NORMAL_RESET` 让设备重启 |
 | `flash_at.py` | 整包刷 PAC（QuecPython 恢复） |
+| `dump_flash.py` | 整片备份 / 回滚（`dump_flash.py` / `dump_flash.py --restore <bin> --addr 0x60000000`） |
 | `fw.pac` | 官方 PAC（FDL1/FDL2/BOOT/AP/APPIMG/PS/NV…） |
 | `third_party/sprdflash/` | 纯 Python 的 Spreadtrum/UNISOC 刷写实现（PDL/BSL/PAC） |
 | `py/` | 便携 Python + pyserial（gitignore，可重建） |

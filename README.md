@@ -32,6 +32,9 @@
 
 1. **确认是同款**：主板丝印 `CS80 MB V10`，屏 FPC `H.101.001B02`，模组 `EC600UCNLBR03A04M08`。
    细节见 [`docs/hardware.md`](docs/hardware.md)。
+   **还要看固件代次**：`ATI` 回 `EC600UCNLBR03A04M08_OCPU_QPY`、设备管理器里有 `MI_20`（if32）才是可直接刷的那代；
+   若是 `EC600UCNLBR05A01M08_OCPU_BETA1215`（拉卡拉 1.6，8 个接口、无 `MI_20`），直接刷会黑屏，
+   要先 `flash_at.py` 降级到 R03（先 `dump_flash.py` 整片备份）——见 [`docs/firmware.md`](docs/firmware.md) §0.5。
 2. **Windows 上刷 QDisplay 固件**（只写 APP 分区，不动 NV）：
    `cd win-flash/flash && py\python.exe qdisplay_app.py ..\..\win-display\qdisplay\qdisplay_native.bin --auto`
    完整前置/流程/坑：[`docs/firmware.md`](docs/firmware.md)。
@@ -105,6 +108,7 @@ sudo systemctl enable --now cs80-panel cs80-kiosk
 | Linux 实测 | 重插后 480 Mbps：整帧 2 MB ≈ 0.2 s；曾枚举成 12 Mbps（全速，整帧 ≈ 1.7 s，`usb.speed` 可见） |
 | 已知固件坑 | 个别整帧/局部包 LZ4 解不动（3 s 接收超时，`status=8`）：patch 自动原地重试 3 次；整帧在全速链路上直接走裸块 |
 | 恢复 | `win-flash/flash/fw.pac` 可整包刷回 QuecPython |
+| 新批次（R05） | 出厂是拉卡拉 1.6 固件（8 接口、APP 区非 `2PPA`），QDisplay 刷不进去 → 用 `dump_flash.py` 备份后 `flash_at.py` 降级到 R03，再刷 QDisplay。2026-11 同款新机实测通过 |
 
 ## 目录
 
@@ -121,6 +125,8 @@ win-flash/           刷机与恢复工具 + 官方 QuecPython 固件包（新�
   flash/patch_waiting_page_image.py  把生成的页面换进固件 BIN
   flash/patch_waiting_page.py        0.3.1 等待页倒计时重绘补丁
   flash/reset_download.py    卡在下载模式时用 BSL 复位（不用拔插）
+  flash/dump_flash.py        整片 8 MiB 备份 / 裸写回滚（降级基带前必做）
+  dumps/                     刷机前备份的固件（.gitignore，不进仓库）
 win-display/         官方 Windows 上位机安装包 + 固件 bin（0.3.0 / 0.3.1）+ 摄像头验证脚本
 archive/quecpython/  QuecPython 时代的工具（历史留档，见 docs/dead-ends.md）
 ```

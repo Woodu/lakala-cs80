@@ -7,6 +7,7 @@
 | QDisplay native APP **0.3.0**（`win-display/qdisplay/qdisplay_native.bin`，154400 B） | ✅ 本仓默认 | `features=0x23f`；无待机/唤醒，等待页只画一次 |
 | QDisplay native APP **0.3.1**（`win-display/qdisplay/qdisplay_native_031.bin`，155456 B） | ⏸ 可选（上游最新，**本机实测不稳，未采用**） | `features=0x27f`，多 bit `0x40`；增加 HELLO 18 待机/唤醒、90 s 断连关背光，**等待页带 90 s 倒计时（每秒重绘 → 每秒闪，可用 `patch_waiting_page.py` 关掉）**。2026-11 实测：CRC 正确的官方 0.3.1 能刷入并启动（读到过 `features=0x27f`），但 QDC1 **间歇性不应答**（12 次探测 5 次无响应，同一会话第 2–3 条命令也常超时），像 APP 崩溃重启循环；同机 0.3.0 稳定 → 已回退 0.3.0 |
 | QuecPython（`fw.pac` 整包） | ⏸ 可回退 | 原来的 Python 环境（上不了任意画面，见 `docs/hardware.md` §6） |
+| 拉卡拉原厂 **1.6**（`EC600UCNLBR05A01M08_OCPU_BETA1215`，新批次出厂状态） | ⚠️ **刷不了 QDisplay** | APP 区不是 `2PPA` 容器、USB 没有 if32，装 QDisplay 会黑屏；先按 §0.5 降级到 R03 |
 
 > **刷机只能在 Windows 上做**：进入下载模式后设备枚举成 `0525:a4a7`（CDC 形态），
 > Windows 会自动给它绑 `usbser.sys` 生成 COM 口，脚本走**串口**跑 PDL/FDL 协议；
@@ -57,6 +58,62 @@
 - 但 APP 分区里原来的固件会被覆盖 —— 想恢复原厂/QuecPython 要走 `flash_at.py` 刷 `fw.pac`
   （这一步**会**格式化文件系统 + 重建 NV）
 - 刷完不需要重新做任何校准，设备还是同一台设备的同一套参数
+
+---
+
+## 0.5 新批次（R05 / 拉卡拉 1.6 固件）：先降级到 R03 才能刷
+
+2026-11 实测：新买的一台 CS80 **硬件同款（同一套分区表和模组），但出厂固件是另一代**。
+直接刷 `qdisplay_app.py` 会「写入成功、读回一致、屏黑」，因为 R05 的装载器不认 APP2 容器，
+而且 USB 描述符里根本没有 if32 —— 就算 APP 跑起来也没有数据通道。
+
+### 先判代次（30 秒，刷之前做）
+
+| 判别点 | R03（仓库验证过） | R05 新批次 |
+|---|---|---|
+| `ATI` / `AT+QGMR`（AT 口） | `EC600UCNLBR03A04M08_OCPU_QPY` | `EC600UCNLBR05A01M08_OCPU_BETA1215` |
+| BOOT/AP 头里的构建串 | `1.5 RLS W23.31.1-unknown` | `1.6 RLS_W22.48.2-gCS80_6.12_1.0` |
+| 设备管理器里的接口 | **9 个**，含 if32（`MI_20` → `Quectel USB REPL Port (COMx)`） | **8 个**（`MI_00..MI_07`），**没有 `MI_20`** |
+| `0x60260000` 头 4 字节 | `32 50 50 41` = `2PPA` | `78 b2 db f7` + 裸 ARM 代码（`2d e9 f0 41` = push{r4-r8,lr}） |
+| 刷 QDisplay 后 | 正常出「等待连接」页 | **黑屏**，AT 口正常，所有 COM 口对 QDC1 HELLO 无应答 |
+
+懒人判据：**设备管理器里有没有 `MI_20`**。有就是 R03，可以直接刷；没有就得先降级。
+
+### 降级流程（新机 → 可刷状态）
+
+```bat
+cd win-flash\flash
+
+:: 1) 整片 8 MiB 原厂备份（约 5 分钟，28 KB/s 左右；必须先做，fw.pac 会覆盖全部固件）
+py\python.exe dump_flash.py
+
+:: 2) 用官方 QuecPython 整包把基带换成 R03（会格式化文件系统 + 重建 NV）
+py\python.exe flash_at.py
+
+:: 3) 等设备重启完，确认 ATI 变成 EC600UCNLBR03A04M08_OCPU_QPY、
+::    并且设备管理器里出现 MI_20（Quectel USB REPL Port）
+
+:: 4) 现在才刷 QDisplay（和 §1 完全一样）
+py\python.exe qdisplay_app.py ..\..\win-display\qdisplay\qdisplay_native.bin --auto
+```
+
+验收：`/api/status` 里 `device=up`、`ready.block=520192`、`features=0x23f`（host 的 `qdc1 --probe` 会自动认到 `MI_20` 那个 COM 口）。
+
+回滚原厂（恢复拉卡拉 1.6）：
+
+```bat
+py\python.exe dump_flash.py --restore ..\..\dumps\full_flash_0x60000000_8MiB_<sha8>.bin --addr 0x60000000
+```
+
+### 这一趟踩的坑
+
+| 坑 | 现象 | 处理 |
+|---|---|---|
+| 以为「同款」就是同一个固件 | 同一型号两台，一台能刷一台黑屏 | 买第二台先按上表判代次，别只看主板丝印/FPC |
+| 刷完 `fw.pac` 设备整个从 USB 消失 | 0 个 COM，`2C7C`/`0525` 都不在 | 正常：模块会重启两三轮。拔 DC+Type-C 等 10 s，先插 12V 再插 Type-C |
+| 桌面壳占着 AT 口 | `PermissionError(13, '拒绝访问')` / `Cannot configure port` | 刷机前退出 `cs80-panel`：它的 `qdc1.exe --probe` 会逐个 COM 口扫（也解释了为什么「AT 口超时」但手动 `ATI` 正常） |
+| `READ_FLASH` 大 chunk 静默回空 | 读速基准显示 55 MB/s，dump 出来 **0 字节** | `chunk` 只用到 `0x8000`，而且每条读都要校验返回长度（`dump_flash.py` 已做） |
+| 只备份 APP 分区 | 原厂 APP 已覆盖后才发现格式不是 APP2，救不回来 | 降级/换固件之前一律先整片 8 MiB dump |
 
 ---
 
@@ -184,6 +241,7 @@ win-flash/
 └── flash/
     ├── qdisplay_app.py                刷 QDisplay APP（写 0x60260000）
     ├── flash_at.py                    刷回 QuecPython（整包 + 格式化）
+    ├── dump_flash.py                  整片备份 / 裸写回滚（降级、改基带前必做）
     ├── fw.pac                         官方 PAC
     ├── third_party/sprdflash/         纯 Python 刷写器（PDL/FDL over libusb）
     ├── quectel-usb-driver.zip         Windows USB 驱动
