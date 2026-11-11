@@ -1043,8 +1043,9 @@ export const WIDGETS = {
     },
     needs: {
       kind: 'portfolio',
-      // 期货时段价格动得慢，60 秒足够；A 股/美股盘中 15 秒
-      ttl: () => (stockSession().id === 'fut' ? 60000 : 15000),
+      // 期货也是连续交易，价格每秒都在动；60 秒会让屏上看着像收盘了。
+      // 统一 15 秒（host 侧 portfolio 缓存 10 秒，能真的拿到新价）。
+      ttl: 15000,
       query: (cfg) => ({ symbols: stockSymbols(cfg) }),
     },
     draw(ctx, r, cfg, d, t) {

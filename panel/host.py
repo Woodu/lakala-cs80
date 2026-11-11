@@ -2413,7 +2413,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, CACHE.get("mi:" + sym, 30, lambda: minute(sym)))
         if path == "/api/data/portfolio":
             syms = (qs.get("symbols") or ["sh000001,sz399001"])[0]
-            return self._send(200, CACHE.get("pf:" + syms, 20, lambda: portfolio(syms)))
+            return self._send(200, CACHE.get("pf:" + syms, 10, lambda: portfolio(syms)))
         if path == "/api/data/crypto":
             ids = (qs.get("ids") or ["bitcoin,ethereum"])[0]
             return self._send(200, CACHE.get("cr:" + ids, 60, lambda: crypto(ids)))
