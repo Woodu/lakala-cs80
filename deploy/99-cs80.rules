@@ -1,0 +1,2 @@
+# 拉卡拉 CS80 客显屏 (Quectel EC600U) — QDC1 数据口
+SUBSYSTEM=="usb", ATTR{idVendor}=="2c7c", ATTR{idProduct}=="0901", MODE="0660", GROUP="plugdev"

@@ -2257,6 +2257,9 @@ class Handler(BaseHTTPRequestHandler):
             if ext == ".html":
                 text = re.sub(r'(src="[^"?]+\.js)(")', r'\1?v=' + v + r'\2', text)
                 text = re.sub(r'(href="[^"?]+\.css)(")', r'\1?v=' + v + r'\2', text)
+                if sys.platform.startswith("linux"):
+                    # 无桌面主机：默认页面只做编辑器，推帧交给后台 kiosk（?kiosk=1）
+                    text = text.replace("</head>", "<script>window.__CS80_HEADLESS__=true;</script></head>", 1)
             else:
                 text = re.sub(r"(from\s*['\"]\./[^'\"]+?)(['\"])", r"\1?v=" + v + r"\2", text)
             body = text.encode()

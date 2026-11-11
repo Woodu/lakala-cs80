@@ -5,6 +5,10 @@ import { applyZoom, deleteCurrentPage, initEditor, renderAll, renderTile, tiles,
 
 const el = (sel) => document.querySelector(sel);
 const pusher = new Pusher();
+const QS = new URLSearchParams(location.search);
+const KIOSK = QS.has("kiosk");
+const EDIT_ONLY = !!window.__CS80_HEADLESS__ && !KIOSK;
+if (EDIT_ONLY) pusher.paused = true;  // 无桌面主机：浏览器只编辑，推帧交给后台 kiosk
 
 function paintStats(st) {
   const pill = el('#push-pill');
@@ -136,6 +140,13 @@ async function boot() {
     }
     toast(paused ? '已暂停推帧（屏上定格）' : '已恢复推送');
   };
+  if (EDIT_ONLY) {
+    const b = el('#btn-pause');
+    b.disabled = true;
+    b.textContent = '后台推送中';
+    b.classList.add('primary');
+    b.title = '屏幕由本机 kiosk 服务持续推送；这里只编辑布局';
+  }
   // 纯色自检：整屏刷一种颜色，用来看屏自身的闪（背光 PWM / 面板 / 固件重绘）
   // 先把推送暂停，否则下一次 tick 会立刻把纯色盖回去
   for (const btn of document.querySelectorAll('#diag-colors button')) {
@@ -291,6 +302,19 @@ async function boot() {
   };
   setRate(200);
   setRateFn = setRate;
+
+  // kiosk：布局被编辑器改动后自动重载，保持“编辑器只改布局、后台负责上屏”
+  if (KIOSK) {
+    let sig = null;
+    setInterval(async () => {
+      try {
+        const l = await (await fetch('/api/layout', { cache: 'no-store' })).json();
+        const s = JSON.stringify(l);
+        if (sig === null) sig = s;
+        else if (s !== sig) location.reload();
+      } catch (e) { /* host 重启中，下一轮再试 */ }
+    }, 2500);
+  }
 
   await initScreensaver();
 

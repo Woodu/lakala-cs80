@@ -64,12 +64,23 @@ Linux 上没有 IOKit，`libusb` 又因为内部 32 位接口位图**打不开�
 cd panel
 gcc -O2 -o qdc1 qdc1.c lz4.c
 ./qdc1 --hello                     # {"qdc1":true,"block":520192}
-python3 host.py --port 8787        # 浏览器/SSH 隧道访问 http://127.0.0.1:8787
 ```
 
-- 需要 root，或给 `2c7c:0901` 加 udev 规则（`MODE="0660" GROUP="plugdev"`）。
-- 首次 claim 会把接口 32 从 `option` 驱动上摘下来（`ttyUSB6` 消失），这是正常的。
-- `host.py` 默认只绑 `127.0.0.1`；局域网访问用 `--host 0.0.0.0`（界面无鉴权，仅限可信内网），或 `ssh -L 8787:127.0.0.1:8787`。
+无桌面常驻：编辑器只负责改布局，后台 kiosk 负责持续推帧（关掉浏览器也不影响屏）。
+
+```bash
+sudo install -m 644 deploy/99-cs80.rules /etc/udev/rules.d/
+sudo install -m 644 deploy/cs80-panel.service deploy/cs80-kiosk.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cs80-panel cs80-kiosk
+```
+
+- `cs80-panel`：`host.py --host 0.0.0.0 --port 8787`，局域网编辑器入口。
+- `cs80-kiosk`：headless Chromium 打开 `http://127.0.0.1:8787/?kiosk=1`，持续渲染推帧；
+  布局被编辑器改完后 2.5 秒内自动重载。Chromium 路径按本机 Playwright 安装位置写在 unit 里，换机器要改。
+- Linux 上不带 `?kiosk=1` 的页面默认只编辑、不推帧（按钮显示“后台推送中”），避免和 kiosk 抢帧。
+- 需要 root，或给 `2c7c:0901` 加 udev 规则；首次 claim 会把接口 32 从 `option` 驱动摘下来（`ttyUSB6` 消失），属正常。
+- 界面无鉴权，`--host 0.0.0.0` 仅限可信内网；外网用 `ssh -L 8787:127.0.0.1:8787`。
 - Linux 下锁屏/显示器休眠联动不可用，其余功能（帧、patch、屏保、音频）一致。
 
 ## 已验证的现状
