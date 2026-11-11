@@ -54,6 +54,24 @@
 10. **长期运行**：桌面壳带托盘 + 关窗不退出 + host 监督线程（host 死了自动重启）；
     开机自启用系统登录项。
 
+## Linux（无桌面 / usbfs）
+
+Linux 上没有 IOKit，`libusb` 又因为内部 32 位接口位图**打不开接口 32**（`LIBUSB_ERROR_INVALID_PARAM`），
+所以 sidecar 直接用 usbfs ioctl。`qdc1.c` 已带 `__linux__` 分支：自动按 VID:PID 找 `/dev/bus/usb/BBB/DDD`，
+用 `USBDEVFS_DISCONNECT_CLAIM` 踢掉 `option` 驱动并 claim 接口 32，再走 `USBDEVFS_BULK`。
+
+```bash
+cd panel
+gcc -O2 -o qdc1 qdc1.c lz4.c
+./qdc1 --hello                     # {"qdc1":true,"block":520192}
+python3 host.py --port 8787        # 浏览器/SSH 隧道访问 http://127.0.0.1:8787
+```
+
+- 需要 root，或给 `2c7c:0901` 加 udev 规则（`MODE="0660" GROUP="plugdev"`）。
+- 首次 claim 会把接口 32 从 `option` 驱动上摘下来（`ttyUSB6` 消失），这是正常的。
+- `host.py` 只绑 `127.0.0.1`；无桌面时用 `ssh -L 8787:127.0.0.1:8787` 在本机浏览器打开编辑器。
+- Linux 下锁屏/显示器休眠联动不可用，其余功能（帧、patch、屏保、音频）一致。
+
 ## 已验证的现状
 
 | 项 | 值 |

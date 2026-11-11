@@ -47,12 +47,18 @@ static double wall_ms(void) {
 #include <poll.h>
 #include <sys/time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/usbdevice_fs.h>
+#endif
 static int wait_stdin(int ms) { struct pollfd p = {0, POLLIN, 0}; return poll(&p, 1, ms) > 0; }
 static double wall_ms(void) { struct timeval t; gettimeofday(&t, 0); return t.tv_sec*1e3 + t.tv_usec/1e3; }
 #endif
 
-#ifdef _WIN32
-#else
+#if !defined(_WIN32) && !defined(__linux__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOCFPlugIn.h>
@@ -137,6 +143,10 @@ struct link_s;
 typedef struct link_s {
 #ifdef _WIN32
   HANDLE port;
+#elif defined(__linux__)
+  int fd;
+  int iface;
+  uint8_t ep_out, ep_in;
 #else
   IOUSBInterfaceInterface **intf;
   uint8_t pipe_out, pipe_in;
@@ -145,7 +155,108 @@ typedef struct link_s {
   uint32_t seq;
 } link_t;
 
-#ifndef _WIN32
+#if defined(__linux__) /* ---------- Linux：usbfs（接口 32 超出 libusb 0..31 位图） ---------- */
+static int read_sys(const char *path, char *buf, size_t n) {
+  FILE *f = fopen(path, "r");
+  if (!f) return -1;
+  if (!fgets(buf, (int)n, f)) { fclose(f); return -1; }
+  fclose(f);
+  buf[strcspn(buf, "\n")] = 0;
+  return 0;
+}
+
+static int find_device(char *out, size_t n) {
+  DIR *d = opendir("/sys/bus/usb/devices");
+  if (!d) return -1;
+  struct dirent *e;
+  int found = -1;
+  while ((e = readdir(d))) {
+    if (e->d_name[0] == '.') continue;
+    char p[512], v[16], pid[16], bus[16], dev[16];
+    snprintf(p, sizeof p, "/sys/bus/usb/devices/%s/idVendor", e->d_name);
+    if (read_sys(p, v, sizeof v) || strcmp(v, "2c7c")) continue;
+    snprintf(p, sizeof p, "/sys/bus/usb/devices/%s/idProduct", e->d_name);
+    if (read_sys(p, pid, sizeof pid) || strcmp(pid, "0901")) continue;
+    snprintf(p, sizeof p, "/sys/bus/usb/devices/%s/busnum", e->d_name);
+    if (read_sys(p, bus, sizeof bus)) continue;
+    snprintf(p, sizeof p, "/sys/bus/usb/devices/%s/devnum", e->d_name);
+    if (read_sys(p, dev, sizeof dev)) continue;
+    snprintf(out, n, "/dev/bus/usb/%03d/%03d", atoi(bus), atoi(dev));
+    found = 0;
+    break;
+  }
+  closedir(d);
+  return found;
+}
+
+static int open_link(link_t *l, int iface_number) {
+  char path[128];
+  l->fd = -1;
+  if (find_device(path, sizeof path)) {
+    fprintf(stderr, "cs80: 找不到 2c7c:0901 设备\n");
+    return -1;
+  }
+  int fd = open(path, O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    fprintf(stderr, "cs80: 打开 %s 失败：%s（root 或 udev 权限）\n", path, strerror(errno));
+    return -3;
+  }
+  /* 一步完成「踢掉 option 驱动 + claim 接口」，比先 unbind 稳。 */
+  struct usbdevfs_disconnect_claim dc;
+  memset(&dc, 0, sizeof dc);
+  dc.interface = (unsigned)iface_number;
+  dc.flags = USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER;
+  if (ioctl(fd, USBDEVFS_DISCONNECT_CLAIM, &dc) < 0) {
+    unsigned i = (unsigned)iface_number;
+    if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &i) < 0) {
+      fprintf(stderr, "cs80: claim 接口 %d 失败：%s\n", iface_number, strerror(errno));
+      close(fd);
+      return -3;
+    }
+  }
+  l->fd = fd;
+  l->iface = iface_number;
+  l->ep_out = getenv("CS80_EP_OUT") ? (uint8_t)strtoul(getenv("CS80_EP_OUT"), NULL, 0) : 0x08;
+  l->ep_in = getenv("CS80_EP_IN") ? (uint8_t)strtoul(getenv("CS80_EP_IN"), NULL, 0) : 0x8b;
+  l->tx = malloc(32 + BLOCK_BYTES);
+  if (!l->tx) {
+    unsigned i = (unsigned)iface_number;
+    ioctl(fd, USBDEVFS_RELEASEINTERFACE, &i);
+    close(fd);
+    l->fd = -1;
+    return -4;
+  }
+  fprintf(stderr, "cs80: %s if%d ep_out=0x%02x ep_in=0x%02x\n", path, iface_number, l->ep_out, l->ep_in);
+  return 0;
+}
+
+static void close_link(link_t *l) {
+  if (l->fd >= 0) {
+    unsigned i = (unsigned)l->iface;
+    ioctl(l->fd, USBDEVFS_RELEASEINTERFACE, &i);
+    close(l->fd);
+    l->fd = -1;
+  }
+  free(l->tx);
+  l->tx = NULL;
+}
+
+static int raw_write(link_t *l, const void *buf, uint32_t len) {
+  struct usbdevfs_bulktransfer t = { .ep = l->ep_out, .len = len, .timeout = 5000, .data = (void *)buf };
+  int r = ioctl(l->fd, USBDEVFS_BULK, &t);
+  if (r < 0) return -errno;
+  return r == (int)len ? 0 : -EIO;
+}
+
+static int raw_read(link_t *l, void *buf, uint32_t *len, int timeout_ms) {
+  struct usbdevfs_bulktransfer t = { .ep = l->ep_in, .len = *len, .timeout = timeout_ms, .data = buf };
+  int r = ioctl(l->fd, USBDEVFS_BULK, &t);
+  if (r < 0) { *len = 0; return -errno; }
+  *len = (uint32_t)r;
+  return 0;
+}
+
+#elif !defined(_WIN32) /* ---------- macOS：IOKit ---------- */
 static int get_num(io_service_t s, CFStringRef key, int *out) {
   CFTypeRef v = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);
   int ok = 0;
