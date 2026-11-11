@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1349,6 +1350,57 @@ def _news_juejin():
             for x in d.get("data") or []]
 
 
+def _news_sspai():
+    d = http_json("https://sspai.com/api/v1/article/tag/page/get?limit=40&offset=0&tag=%E7%83%AD%E9%97%A8%E6%96%87%E7%AB%A0",
+                  {"User-Agent": NEWS_UA, "Referer": "https://sspai.com/"})
+    return [{"title": x.get("title")} for x in d.get("data") or []]
+
+
+def _news_ithome():
+    d = http_json("https://api.ithome.com/json/newslist/news", {"User-Agent": NEWS_UA})
+    return [{"title": x.get("title"), "hot": _hot_number(x.get("commentcount"))}
+            for x in d.get("newslist") or []]
+
+
+def _news_36kr():
+    body = json.dumps({"partner_id": "wap", "param": {"siteId": 1, "platformId": 2}, "timestamp": 0}).encode()
+    req = urllib.request.Request(
+        "https://gateway.36kr.com/api/mis/nav/home/nav/rank/hot", data=body,
+        headers={"User-Agent": NEWS_UA, "Content-Type": "application/json",
+                 "Referer": "https://36kr.com/", "Connection": "close"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        d = json.loads(resp.read().decode("utf-8", "replace"))
+    rows = (d.get("data") or {}).get("hotRankList") or []
+    return [{"title": (x.get("templateMaterial") or {}).get("widgetTitle")} for x in rows]
+
+
+def _news_wscn():
+    # 华尔街见闻快讯：标题大多为空，取正文首句
+    d = http_json("https://api-one-wscn.awtmt.com/apiv1/content/lives?channel=global-channel&client=pc&limit=40",
+                  {"User-Agent": NEWS_UA, "Referer": "https://wallstreetcn.com/"})
+    out = []
+    for x in (d.get("data") or {}).get("items") or []:
+        title = (x.get("title") or x.get("content_text") or "").strip()
+        if title:
+            out.append({"title": title.split("\n")[0], "hot": _hot_number(x.get("score"))})
+    return out
+
+
+def _news_hn():
+    # Hacker News 首页（用 Algolia 的公开接口，省得一条条取 item）
+    d = http_json("https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=40",
+                  {"User-Agent": NEWS_UA})
+    return [{"title": x.get("title"), "hot": _hot_number(x.get("points"))} for x in d.get("hits") or []]
+
+
+def _news_tieba():
+    req = urllib.request.Request("https://tieba.baidu.com/hottopic/browse/topicList?res_type=1",
+                                 headers={"User-Agent": NEWS_UA, "Referer": "https://tieba.baidu.com/"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        html = resp.read().decode("utf-8", "replace")
+    return [{"title": t} for t in re.findall(r'class="topic-text"[^>]*>([^<]+)<', html)]
+
+
 # ---------- 假期 ----------
 # 数据照 holiday-cn（github.com/NateScarlet/holiday-cn）：每年一份 JSON，国务院公布后更新。
 # 只取 isOffDay 的日子（调休上班日丢掉），再把同名连续日期拼成一个假期区间。
@@ -1401,24 +1453,40 @@ NEWS = {
     "weibo": _news_weibo,
     "v2ex": _news_v2ex,
     "juejin": _news_juejin,
+    "sspai": _news_sspai,
+    "ithome": _news_ithome,
+    "36kr": _news_36kr,
+    "wscn": _news_wscn,
+    "hackernews": _news_hn,
+    "tieba": _news_tieba,
 }
 
 
+def _news_one(sid):
+    fn = NEWS.get(sid)
+    if not fn:
+        return None
+    return CACHE.get("news:" + sid, 180, fn)
+
+
 def news(sources):
-    """{sourceId: [{title, hot}]}，只抓请求里点名的几个源；有源回退到旧值就标 stale"""
-    out, stale = {}, False
-    for sid in [s.strip() for s in str(sources).split(",") if s.strip()][:8]:
-        fn = NEWS.get(sid)
-        if not fn:
-            continue
-        val = CACHE.get("news:" + sid, 180, fn)
-        if isinstance(val, list):
-            out[sid] = [x for x in val if isinstance(x, dict) and x.get("title")]
-        else:
-            out[sid] = []
-            stale = True
-    if stale:
-        out["stale"] = True  # 组件据此在 Tab 右上角显示「更新失败·重取中」
+    """{sourceId: [{title, hot}]}，只抓请求里点名的几个源；有源回退到旧值就标 stale。
+    多个源并发抓（最慢一个决定总耗时），别让前端为 12 个源等半分钟。"""
+    ids = [s.strip() for s in str(sources).split(",") if s.strip()][:16]
+    ids = [sid for sid in ids if sid in NEWS]
+    out, failed = {}, 0
+    if ids:
+        with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+            results = list(pool.map(_news_one, ids))
+        for sid, val in zip(ids, results):
+            if isinstance(val, list):
+                out[sid] = [x for x in val if isinstance(x, dict) and x.get("title")]
+            else:
+                out[sid] = []
+                failed += 1
+    # 只有「全挂了」才整体标 stale：单个源被墙（比如知乎要过验证）不该让整个组件报警
+    if ids and failed == len(ids):
+        out["stale"] = True
     return out
 
 

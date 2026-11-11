@@ -3,7 +3,7 @@ import {
   CELL, COLS, ROWS, W, H, state, activePage, gridPage, loadLayout, loadPageModule, saveLayout,
   setActivePage, touchWidget, widgetById,
 } from './core.js';
-import { THEME, WIDGETS, NEWS_TABS, newsSources } from './widgets.js';
+import { THEME, WIDGETS, NEWS_TABS, NEWS_LABEL, newsSources, newsLabel } from './widgets.js';
 
 const { GridStack } = window;
 
@@ -514,18 +514,7 @@ function renderInspector() {
       hooks.onLayoutChange && hooks.onLayoutChange();
     });
   });
-  box.querySelectorAll('[data-news]').forEach((input) => {
-    input.addEventListener('change', () => {
-      const picked = new Set(newsSources(w.config));
-      if (input.checked) picked.add(input.dataset.news);
-      else picked.delete(input.dataset.news);
-      w.config.sources = NEWS_TABS.filter(([id]) => picked.has(id)).map(([id]) => id);
-      if (hooks.invalidateData) hooks.invalidateData(w.id);
-      renderTile(w);
-      scheduleSave();
-      hooks.onLayoutChange && hooks.onLayoutChange();
-    });
-  });
+  if (w.type === 'news') bindNewsControls(box, w);
   box.querySelector('[data-act="dup"]').onclick = () => duplicateWidget(w.id);
   box.querySelector('[data-act="del"]').onclick = () => removeWidget(w.id);
 }
@@ -581,18 +570,81 @@ function agentToggles(w) {
     }</div>`;
 }
 
-/** 资讯组件：勾选的数据源 = 顶部 Tab（按 NEWS_TABS 顺序，别让用户点选顺序影响 Tab 顺序） */
+/** 资讯组件：勾选的数据源 = 顶部 Tab（可拖动排序 + 改 Tab 名字） */
 function newsToggles(w) {
-  const on = new Set(newsSources(w.config));
-  const rows = NEWS_TABS.map(
-    ([id, label]) => `<label class="check">
-      <input type="checkbox" data-news="${esc(id)}" ${on.has(id) ? 'checked' : ''}>
-      <span>${esc(label)}</span>
-    </label>`
-  ).join('');
-  return `<div class="section-label">数据源（顶部 Tab）</div>
-    <div class="checks">${rows}</div>
-    <div class="hint">勾选的源按秒数自动轮换 Tab；组件高度决定显示多少条。</div>`;
+  const on = newsSources(w.config);
+  const labels = w.config.labels || {};
+  const off = NEWS_TABS.map(([id]) => id).filter((id) => !on.includes(id));
+
+  const onRow = (id, i) => `
+    <div class="check news-row">
+      <input type="checkbox" data-news="${esc(id)}" checked title="取消勾选＝不显示这个 Tab">
+      <input class="input news-name" data-news-label="${esc(id)}" value="${esc(labels[id] || '')}"
+             placeholder="${esc(NEWS_LABEL[id])}" title="Tab 显示名，留空用默认">
+      <button class="btn btn-sm icon" data-news-up="${esc(id)}" ${i === 0 ? 'disabled' : ''} title="上移">↑</button>
+      <button class="btn btn-sm icon" data-news-down="${esc(id)}" ${i === on.length - 1 ? 'disabled' : ''} title="下移">↓</button>
+    </div>`;
+
+  const offRow = (id) => `
+    <label class="check muted">
+      <input type="checkbox" data-news="${esc(id)}">
+      <span>${esc(NEWS_LABEL[id])}</span>
+    </label>`;
+
+  return `<div class="section-label">数据源（顶部 Tab，按顺序轮播）</div>
+    <div class="checks">
+      ${on.map(onRow).join('')}
+      ${off.map(offRow).join('')}
+    </div>
+    <div class="hint">勾选＝启用；↑↓ 调顺序；中间输入框可以改 Tab 名字（留空用默认名）。</div>`;
+}
+
+/** 资讯组件的排序 / 改名 / 勾选事件 */
+function bindNewsControls(box, w) {
+  const commit = () => {
+    if (hooks.invalidateData) hooks.invalidateData(w.id);
+    renderTile(w);
+    scheduleSave();
+    hooks.onLayoutChange && hooks.onLayoutChange();
+  };
+  box.querySelectorAll('[data-news]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const id = input.dataset.news;
+      const on = newsSources(w.config);
+      w.config.sources = input.checked
+        ? [...on.filter((x) => x !== id), id]          // 新启用排到最后
+        : on.filter((x) => x !== id);
+      commit();
+      renderInspector();
+    });
+  });
+  box.querySelectorAll('[data-news-up], [data-news-down]').forEach((btn) => {
+    btn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const up = 'newsUp' in btn.dataset;
+      const id = up ? btn.dataset.newsUp : btn.dataset.newsDown;
+      const list = newsSources(w.config);
+      const i = list.indexOf(id);
+      const j = up ? i - 1 : i + 1;
+      if (i < 0 || j < 0 || j >= list.length) return;
+      [list[i], list[j]] = [list[j], list[i]];
+      w.config.sources = list;
+      commit();
+      renderInspector();
+    });
+  });
+  box.querySelectorAll('[data-news-label]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const id = input.dataset.newsLabel;
+      const name = input.value.trim();
+      const labels = { ...(w.config.labels || {}) };
+      if (name && name !== NEWS_LABEL[id]) labels[id] = name;
+      else delete labels[id];
+      w.config.labels = labels;
+      commit();
+    });
+  });
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));

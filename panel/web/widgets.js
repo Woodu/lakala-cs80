@@ -1537,7 +1537,7 @@ export const WIDGETS = {
     label: '资讯',
     icon: '<path d="M3 3.5h10v9H3z"/><path d="M5 6h6M5 8.5h5M5 11h3"/>',
     min: [3, 2],
-    config: { sources: ['toutiao', 'baidu', 'zhihu', 'weibo'], rotate: 60 },
+    config: { sources: ['toutiao', 'baidu', 'zhihu', 'weibo'], rotate: 60, labels: {} },
     needs: { kind: 'news', ttl: 180000, query: (cfg) => ({ sources: newsSources(cfg).join(',') }) },
     draw(ctx, r, cfg, d, t) {
       const pad = Math.max(10, r.w * 0.028);
@@ -1556,17 +1556,40 @@ export const WIDGETS = {
       let tabFont = Math.max(13, Math.min(inner.h * 0.1, inner.w * 0.034, 24));
       const stripW = () => {
         ctx.font = font(tabFont, 500);
-        return ids.reduce((s, id) => s + ctx.measureText(NEWS_LABEL[id]).width + tabFont * 1.5, 0);
+        return ids.reduce((s, id) => s + ctx.measureText(newsLabel(cfg, id)).width + tabFont * 1.5, 0);
       };
       while (stripW() > inner.w && tabFont > 11) tabFont *= 0.94;
       const tabH = tabFont * 1.9;
       const active = Math.floor(Date.now() / (Math.max(5, Number(cfg.rotate) || 60) * 1000)) % ids.length;
       ctx.textBaseline = 'middle';
+      ctx.font = font(tabFont, 500);
+      const gap = tabFont * 0.3;
+      const tabs = ids.map((id) => ({ id, w: ctx.measureText(newsLabel(cfg, id)).width + tabFont * 1.2 }));
+      const total = tabs.reduce((sum, t) => sum + t.w + gap, 0) - gap;
+      // Tab 太多放不下时，只画「以当前 Tab 为中心」能放下的那一段，保证高亮的那个永远可见
+      let a = 0;
+      let b = tabs.length - 1;
+      let used = total;
+      if (total > inner.w) {
+        a = b = active;
+        used = tabs[active].w;
+        let l = active - 1;
+        let r = active + 1;
+        for (;;) {
+          if (r < tabs.length && used + tabs[r].w + gap <= inner.w) {
+            used += tabs[r].w + gap;
+            b = r;
+            r++;
+          } else if (l >= 0 && used + tabs[l].w + gap <= inner.w) {
+            used += tabs[l].w + gap;
+            a = l;
+            l--;
+          } else break;
+        }
+      }
       let tx = inner.x;
-      ids.forEach((id, i) => {
-        ctx.font = font(tabFont, 500);
-        const w = ctx.measureText(NEWS_LABEL[id]).width + tabFont * 1.2;
-        if (tx + w > inner.x + inner.w + 1) return;
+      for (let i = a; i <= b; i++) {
+        const { id, w } = tabs[i];
         if (i === active) {
           roundRect(ctx, tx, inner.y, w, tabH, tabH * 0.28);
           ctx.fillStyle = 'rgba(255,255,255,0.10)';
@@ -1576,9 +1599,9 @@ export const WIDGETS = {
           ctx.fillStyle = t.fg3;
         }
         ctx.textAlign = 'center';
-        ctx.fillText(NEWS_LABEL[id], tx + w / 2, inner.y + tabH / 2 + 0.5);
-        tx += w + tabFont * 0.3;
-      });
+        ctx.fillText(newsLabel(cfg, id), tx + w / 2, inner.y + tabH / 2 + 0.5);
+        tx += w + gap;
+      }
 
       const items = (d && d[ids[active]]) || [];
       // 右上角小字：更新时间（拉取失败时变成提示，数据仍然是旧的）
@@ -1733,14 +1756,26 @@ export const NEWS_TABS = [
   ['baidu', '百度'],
   ['zhihu', '知乎'],
   ['weibo', '微博'],
+  ['tieba', '贴吧'],
   ['v2ex', 'V2EX'],
   ['juejin', '掘金'],
+  ['sspai', '少数派'],
+  ['ithome', 'IT之家'],
+  ['36kr', '36氪'],
+  ['wscn', '华尔街见闻'],
+  ['hackernews', 'HN'],
 ];
-const NEWS_LABEL = Object.fromEntries(NEWS_TABS);
+export const NEWS_LABEL = Object.fromEntries(NEWS_TABS);
 
-/** 勾选的数据源（默认全开；未知 id 丢掉） */
+/** 勾选的数据源（按配置里的顺序；默认全开；未知 id 丢掉） */
 export function newsSources(cfg) {
   const picked = cfg && Array.isArray(cfg.sources) ? cfg.sources : NEWS_TABS.map(([id]) => id);
   return picked.filter((id) => NEWS_LABEL[id]);
+}
+
+/** Tab 显示名：用户改过就用改的（cfg.labels），否则用默认名 */
+export function newsLabel(cfg, id) {
+  const custom = cfg && cfg.labels && cfg.labels[id];
+  return (custom && String(custom).trim()) || NEWS_LABEL[id];
 }
 export { card, tracked, font, roundRect, fitFont, ellipsis, weatherIcon, weatherKind };
