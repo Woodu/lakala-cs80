@@ -434,9 +434,21 @@ function sparkline(ctx, x, y, w, h, data, color) {
   ctx.stroke();
 }
 /**
+ * 分时整段时间轴的分钟数：
+ *   A 股 241（9:30–15:00）/ 美股 391（9:30–16:00）/ CME 期货 1380（北京 07:00–次日 06:00）。
+ * 有了它，盘中曲线只画到当前进度，右边留白，和券商 APP 一致。
+ */
+export function minuteSlots(symbol) {
+  const s = String(symbol || '').trim();
+  if (/^103\./.test(s)) return 1380;  // 外盘期货（ES/NQ…）
+  if (/^100\./.test(s)) return 391;   // 美股指数
+  return 241;                          // A 股
+}
+
+/**
  * 分时图：昨收虚线 + 涨跌面积/折线（box 用绝对坐标）。
- * slots = 整个交易时段的分钟数（A 股 241 / 美股 391）：给了就按时间轴画，
- * 盘中只画到当前进度、右边留白；不给就按现有数据铺满（期货/自定义页面）。
+ * slots = 整个交易时段的分钟数（A 股 241 / 美股 391 / 期货 1380）：给了就按时间轴画，
+ * 盘中只画到当前进度、右边留白；不给就按现有数据铺满。
  */
 export function minuteChart(ctx, box, points, preClose, color, slots) {
   if (!points || points.length < 2) {
@@ -1075,7 +1087,9 @@ export const WIDGETS = {
       const rows = Math.max(1, Math.min(items.length, fit, perCell));
       const rowH = Math.min(200, (inner.h - gap * (rows - 1)) / rows);
       // 盘中：分时图按整段时间轴画，只走到当前时刻，右边留白（一眼看出还在走）
-      const slots = { cn: 241, us: 391 }[session.id];
+      // 期货是 23 小时连续交易（07:00–次日 06:00），少了 fut 就会把 14 小时拉满整宽，
+      // 看起来像「已经收盘/顶到头」。
+      const slots = { cn: 241, us: 391, fut: 1380 }[session.id];
       for (let i = 0; i < rows; i++) {
         stockRow(ctx, { x: inner.x, y: inner.y + i * (rowH + gap), w: inner.w, h: rowH }, items[i], t, {
           card: false,

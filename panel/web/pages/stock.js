@@ -15,7 +15,7 @@ const FG3 = '#8b8c96';
 const FG4 = '#52535c';
 const CARD = '#1a1c22';
 
-import { minuteChart, stockRow, tradingHours, freshStamp } from '../widgets.js';
+import { minuteChart, stockRow, tradingHours, freshStamp, minuteSlots } from '../widgets.js';
 
 const font = (size, weight = 400, mono = false) => `${weight} ${size}px ${mono ? MONO : FONT}`;
 
@@ -117,7 +117,8 @@ export default {
       { x: pad + 28, y: cardY + 186, w: w - pad * 2 - 56, h: cardH - 202 },
       lead.points,
       lead.preClose ?? lead.prev,
-      color
+      color,
+      minuteSlots(lead.symbol)
     );
 
     // 其余标的：一行一只，和网格里的股票组件同一套画法
