@@ -228,6 +228,34 @@ cs80: full frame retry 1 (raw=0, 3009ms)                          ← 这次之�
 已修。原因：浏览器播视频时，窗口被锁屏盖住 → 页面 `hidden` → WebView 把 `setInterval` 节流到 ~1 s。
 现在屏保由 **host 侧 ffmpeg** 解码推帧，不受窗口可见性影响。如果你在别的实现里遇到同类问题，记住这条。
 
+## 股票/期货有价格但没有分时，或整块显示「加载中…」
+
+**先看数据源，不是渲染问题。** 这台 Linux 上实测（2026-11）：
+
+- 东财 `push2*.eastmoney.com` 从主机直接请求是 **Empty reply from server**（没有 HTTP 响应），
+  代理规则也没救回来；浏览器里看到的期货价格/名称是上一次成功抓取后缓存的。
+- 新浪 `hq.sinajs.cn` / `stock2.finance.sina.com.cn` **直连正常**。
+- Yahoo `query1.finance.yahoo.com` 直连 403，走本机 mihomo（`127.0.0.1:7890`）才 200。
+
+所以 `host.py` 的行情兜底是：
+
+| 数据 | 首选 | 兜底 |
+|---|---|---|
+| 外盘期货快照 | 东财 `push2delay` | 新浪 `hf_ES` / `hf_NQ`（`103.XXX00Y` → `hf_XXX`） |
+| 外盘期货分时 | 东财 `trends2` | 新浪 `GlobalFuturesMinLine` |
+| A 股分时 | 东财 `trends2` | 新浪 `CN_MarketDataService` |
+| US 指数快照 | 东财 | 新浪 `gb_$inx` / `gb_$ndx` |
+| US 指数分时 | 东财 | 暂缺（新浪该接口已下线；需要时给 host 配 `HTTPS_PROXY` 走 Yahoo） |
+
+快速验证（不用看屏）：
+
+```bash
+curl -s '127.0.0.1:8787/api/data/portfolio?symbols=103.ES00Y,103.NQ00Y' | head -c 300
+curl -s '127.0.0.1:8787/api/data/minute?symbol=sh000001' | head -c 200
+```
+
+`points` 为空/报错才是数据源问题；有 `points` 但屏上是「无分时」再查前端。
+
 ## 中文变方块
 
 canvas 里用的是系统字体栈（`PingFang SC` / `Microsoft YaHei`）。缺中文字体时会回退到方块，

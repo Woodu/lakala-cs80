@@ -1147,6 +1147,111 @@ def _sina_quote(symbol):
     }
 
 
+SINA_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+
+
+def _sina_http(url, timeout=8):
+    req = urllib.request.Request(url, headers=SINA_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("gbk", "replace")
+
+
+def _sina_foreign_id(symbol):
+    """东财外盘代码 → 新浪代码。
+    103.ES00Y（标普期货）→ hf_ES / 分时 ES；100.SPX/NDX/DJIA → gb_$inx/ndx/dji。
+    返回 (行情代码, 期货分钟代码或 None)。"""
+    s = str(symbol).strip()
+    m = re.match(r"^103\.([A-Za-z0-9]+?)00Y$", s)
+    if m:
+        code = m.group(1).upper()
+        return "hf_" + code, code
+    m = re.match(r"^100\.(SPX|NDX|DJI|DJIA)$", s, re.I)
+    if m:
+        idx = {"SPX": "gb_$inx", "NDX": "gb_$ndx", "DJI": "gb_$dji", "DJIA": "gb_$dji"}[m.group(1).upper()]
+        return idx, None
+    return None, None
+
+
+def _sina_foreign_quote(symbol):
+    """外盘（指数/期货）快照：东财挂掉时用新浪的公开行情顶一下。"""
+    qid, _fut = _sina_foreign_id(symbol)
+    if not qid:
+        raise RuntimeError("新浪不支持这个代码")
+    text = _sina_http("https://hq.sinajs.cn/list=" + urllib.parse.quote(qid))
+    m = re.search(r'="([^"]*)"', text)
+    if not m or not m.group(1):
+        raise RuntimeError("新浪无数据")
+    f = m.group(1).split(",")
+    if qid.startswith("hf_"):
+        price, prev, name = float(f[0]), float(f[7]), (f[13] if len(f) > 13 else symbol)
+    else:  # gb_$xxx：name,price,pct,time,change,...
+        name, price, change = f[0], float(f[1]), float(f[4])
+        prev = price - change
+    return {
+        "symbol": symbol,
+        "name": name or symbol,
+        "price": price,
+        "prev": prev,
+        "change": round(price - prev, 3),
+        "pct": round((price - prev) / prev * 100, 2) if prev else 0.0,
+        "source": "sina",
+    }
+
+
+def _sina_foreign_minute(symbol):
+    """外盘期货分时：新浪 GlobalFuturesMinLine（指数没有可用分时接口）。"""
+    _qid, fut = _sina_foreign_id(symbol)
+    if not fut:
+        raise RuntimeError("这个外盘代码没有分时源")
+    text = _sina_http(
+        "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20t=/"
+        "GlobalFuturesService.getGlobalFuturesMinLine?symbol=" + urllib.parse.quote(fut)
+    )
+    a, b = text.find("("), text.rfind(")")
+    if a < 0 or b <= a:
+        raise RuntimeError("新浪分时格式异常")
+    obj = json.loads(text[a + 1:b])
+    rows = obj.get("minLine_1d") or []
+    if len(rows) < 2:
+        raise RuntimeError("没有分时数据")
+    pre = float(rows[0][1])
+    points = []
+    # 第一行是交易日/昨收/开盘分钟/开盘价；后面是 ["07:01", 价格, ...]
+    points.append([str(rows[0][4])[-5:] if len(rows[0]) > 4 else "07:00", float(rows[0][5] if len(rows[0]) > 5 else pre)])
+    for row in rows[1:]:
+        if len(row) >= 2:
+            points.append([str(row[0])[-5:], float(row[1])])
+    return {"symbol": symbol, "preClose": pre, "points": points, "source": "sina"}
+
+
+def _sina_cn_minute(symbol):
+    """A 股分时兜底：新浪 CN_MarketDataService（东财 trends2 挂掉时用）。"""
+    sym = str(symbol).lower().replace(".", "")
+    if not sym.startswith(("sh", "sz", "bj")):
+        if not sym.isdigit():
+            raise RuntimeError("代码格式：sh000001 / sz399001")
+        sym = ("sh" if sym[0] in "56" else "sz") + sym
+    # 注意：URL 里有 %20，不能用 % 格式化（会被当成格式符），用字符串拼接
+    text = _sina_http(
+        "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20t=/CN_MarketDataService.getKLineData"
+        "?symbol=" + urllib.parse.quote(sym) + "&scale=1&ma=no&datalen=241"
+    )
+    a, b = text.find("("), text.rfind(")")
+    if a < 0 or b <= a:
+        raise RuntimeError("新浪分时格式异常")
+    arr = json.loads(text[a + 1:b])
+    if not arr:
+        raise RuntimeError("没有分时数据")
+    day = str(arr[-1].get("day"))[:10]
+    rows = [r for r in arr if str(r.get("day"))[:10] == day]
+    if not rows:
+        raise RuntimeError("没有分时数据")
+    points = [[str(r["day"])[11:16], float(r["close"])] for r in rows]
+    prev = [r for r in arr if str(r.get("day"))[:10] != day]
+    pre = float(prev[-1]["close"]) if prev else float(rows[0]["open"])
+    return {"symbol": symbol, "preClose": pre, "points": points, "source": "sina"}
+
+
 def _em_quote(symbol):
     """东财快照（A 股走 push2，外盘/期货走 push2delay，后者没有 302 拦截）"""
     fields = "f43,f44,f45,f46,f57,f58,f60,f169,f170"
@@ -1171,9 +1276,13 @@ def _em_quote(symbol):
 
 
 def stock(symbol):
-    """现价快照：A 股 efinance → akshare → 新浪 → 东财；外盘（100.SPX / 103.ES00Y）直接东财"""
+    """现价快照：A 股 efinance → akshare → 新浪 → 东财；外盘东财 → 新浪
+    （2026-11 实测：东财 push2* 从这台机器上直接 Empty reply，新浪外盘行情可用）"""
     if _is_foreign(symbol):
-        return _em_quote(symbol)
+        try:
+            return _em_quote(symbol)
+        except Exception:
+            return _sina_foreign_quote(symbol)
     ef = _opt("efinance")
     if ef is not None:
         try:
@@ -1286,27 +1395,33 @@ def minute(symbol):
             return {"symbol": symbol, "preClose": points and points[0][1], "points": points, "source": "akshare"}
         except Exception:
             pass
-    url = (
-        "https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=%s"
-        "&ut=fa5fd1943c7b386f172d6893dbfba10b&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
-        "&fields2=f51,f53&iscr=0&ndays=1"
-    ) % _secid(symbol)
-    d = http_json(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
-    data = d.get("data") or {}
-    trends = data.get("trends") or []
-    if not trends:
-        raise RuntimeError("没有分时数据")
-    points = []
-    for row in trends:
-        ts, price = row.split(",")[:2]
-        points.append([ts[-5:], float(price)])
-    return {
-        "symbol": symbol,
-        "name": data.get("name") or symbol,
-        "preClose": float(data.get("preClose") or points[0][1]),
-        "points": points,
-        "source": "eastmoney",
-    }
+    try:
+        url = (
+            "https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=%s"
+            "&ut=fa5fd1943c7b386f172d6893dbfba10b&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
+            "&fields2=f51,f53&iscr=0&ndays=1"
+        ) % _secid(symbol)
+        d = http_json(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
+        data = d.get("data") or {}
+        trends = data.get("trends") or []
+        if not trends:
+            raise RuntimeError("没有分时数据")
+        points = []
+        for row in trends:
+            ts, price = row.split(",")[:2]
+            points.append([ts[-5:], float(price)])
+        return {
+            "symbol": symbol,
+            "name": data.get("name") or symbol,
+            "preClose": float(data.get("preClose") or points[0][1]),
+            "points": points,
+            "source": "eastmoney",
+        }
+    except Exception:
+        # 东财被墙/限流时用新浪：外盘走 GlobalFuturesMinLine，A 股走 CN_MarketDataService
+        if _is_foreign(symbol):
+            return _sina_foreign_minute(symbol)
+        return _sina_cn_minute(symbol)
 
 
 # 每只股票最后一次成功的结果：(时间, item)。行情接口偶发空数据/超时时用它顶一下，
