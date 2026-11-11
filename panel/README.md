@@ -25,8 +25,7 @@ open panel/shell/src-tauri/target/release/bundle/macos/"CS80 Panel.app"
 # 或者不打包：
 python3 panel/host.py        # 然后浏览器打开 http://127.0.0.1:8787
 sh panel/run.sh              # macOS：host + Chrome 应用窗口（会自动停掉旧的 launchd 服务）
-panel
-un-windows.cmd        # Windows：host + Edge/Chrome 应用窗口（无地址栏，独立 profile）
+panel\run-windows.cmd        # Windows：host + Edge/Chrome 应用窗口（无地址栏，独立 profile）
 ```
 
 **必须常驻**：固件 5 秒收不到主机命令就回「等待连接」页。桌面壳把「关窗」改成「隐藏到托盘」，
@@ -36,7 +35,8 @@ un-windows.cmd        # Windows：host + Edge/Chrome 应用窗口（无地址栏
 
 ```
 qdc1.c / lz4.c / lz4.h      USB sidecar（QDC1 协议、LZ4、影子 framebuffer、保活、看门狗、音频上传/播放）
-host.py                     常驻 host：HTTP API、数据源、Agent 扫描、屏保(ffmpeg)、锁屏监听、喇叭（MP3→UFS）、静态资源
+host.py                     常驻 host：HTTP API、数据源、Agent 扫描、屏保(ffmpeg)、锁屏监听、音频（任意格式→MP3→UFS）
+kiosk-guard.sh              Linux 无桌面：守护 headless Chromium，页面卡住就重启（见 ../deploy/）
 web/index.html  styles.css  编辑器骨架 + 设计系统（token 来自 glance 的暗色中性 + 金色 accent）
 web/widgets.js              全部组件 + 卡片外壳 card() + 主题 THEME
 web/pages/*.js              自定义页面（示例：自选股 + 分时图）
@@ -70,7 +70,7 @@ add-screensaver.sh          把任意视频转成 800×1280 / 12 fps 放进屏�
 | 加密 | 1×1 | coingecko |
 | GitHub | 1×1 | GitHub API（未授权 60 次/时） |
 | 天气 | 1×1 | open-meteo（可选 macOS 快捷指令，见下） |
-| 音乐 | 1×1 | 本机正在播放（Apple Music / Spotify 等，需授权） |
+| 音乐 | 1×1 | macOS「音乐」App 正在播放的曲目（其它平台返回未在播放） |
 | 电脑指标 | 2×1 | `host_statistics64` CPU + `vm_stat` 内存 + 网速 |
 | RunCat | 2×2 / 5×2 | CPU/MEM 环 + 奔跑猫，速度随 CPU；**右上角显示本机局域网 IP**（取默认路由网卡、会跳过 Clash/FlClash 的 198.18.x TUN 和 VMware 虚拟网卡；`cfg.meta: 'host'` 可改回主机名） |
 | RunCat 条 | 5×2 | 左边奔跑猫 + 右边 CPU/MEM 大数字和折线，宽度不够会自己缩 |
@@ -96,7 +96,7 @@ add-screensaver.sh          把任意视频转成 800×1280 / 12 fps 放进屏�
    └────────────────────────┘
 ```
 
-![默认看板](../docs/default-layout.png)
+![默认看板](../docs/assets/default-layout.png)
 
 改默认布局：直接改 `host.py` 的 `GRID_PAGE`（5 列 × 8 行，每格 160px，`cell = [列, 行, 宽, 高]`）。
 自己的机器上点「恢复默认」会按这份配置重建（会覆盖当前布局）。
@@ -143,13 +143,16 @@ export default {
 - 排序：运行中 → 等待 → 异常 → 已结束，组内按最近活动倒序；无滚动条，按高度取行数
 - 配置项是两级勾选树：整组隐藏某个 Agent，或只隐藏某一条会话（`config.hide` / `config.hideTasks`）
 
-## 喇叭
+## 音频（喇叭）
 
 固件 0.3.0 自带音频通路（`features=0x23f` 的 bit2），PA（QL GPIO22）由固件自己开关，
-所以**不需要重刷固件**，主机侧只要把 MP3 传上去再触发播放。
+所以**不需要重刷固件**，主机侧只要把 MP3 传上去再触发播放。**固件只解 MP3**，
+其它格式（WAV / FLAC / M4A / AAC / OGG / OPUS / WMA / AIFF / AMR，以及 MP4/MOV/MKV 等视频音轨）
+都在主机侧用 ffmpeg 转成 128 kbps MP3 再上传；`ffmpeg_path()` 会找 PATH / Homebrew 常见路径，也可用 `CS80_FFMPEG` 指定。
 
-- UI：侧栏「设备」卡片 → **选择 MP3 并播放** / **停止**（文件最大 4 MiB）
-- `POST /api/audio/file?play=1`：body 直接是 MP3 字节 → 上传完自动播放（浏览器用这个）
+- UI：侧栏「设备」卡片 → **音频播放…** 打开独立面板（选文件、音量滑杆、停止、状态行含转码信息，Esc 关闭）
+- `POST /api/audio/file?play=1&name=xxx.wav`：body 是原始文件字节 → 转码 → 上传 → 播放（浏览器用这个）；
+  输入 ≤64 MiB，转码后需 ≤4 MiB
 - `POST /api/audio`（JSON）：
 
 | action | 参数 | 说明 |
@@ -160,11 +163,16 @@ export default {
 | `play` | `file`（可选） | 无 `file` 播设备上已有文件；有则先上传（哈希相同会跳过）再播 |
 | `upload` | `file` | 只上传，不播放 |
 | `verify` | — | 读回设备文件大小 / XXH32 |
+| `diag` | — | 固件诊断（sub 8）：路由 / 硬件档位 / PA / 增益，只读 |
+| `route` | `value` 0..2 | 停止后改音频路由（0=speaker，正常值） |
 | `say` | `text` | macOS：`say` + `ffmpeg` 合成 MP3 后播放 |
 
 实现：sidecar `0x05/0x06` → QDC1 `type 7/8`；主机按 16 KiB 分块上传并逐块等 ACK，
 文件 XXH32 在 Python 里算（装了 `xxhash` 会更快），按路径+大小+mtime 缓存。
 音频和画面共用一条命令流，`Device.audio_lock` 保证上传/播放不会互相穿插。
+
+**播放自愈**：设备重启后音频路由可能被复位，`PLAY` 会回 `status=4 BAD_STATE`。
+`Device.play_uploaded()` 会读诊断把路由改回 speaker、音量为 0 时补一条音量命令，再重试一次。
 
 ## 屏保
 
@@ -196,7 +204,8 @@ export default {
 
 ## 已知限制
 
-- Windows 传输后端代码已写好但**未实机验证**（见 [`../docs/windows.md`](../docs/windows.md)）
+- Windows：host + sidecar + 推帧已在真机验收（见 [`../docs/windows.md`](../docs/windows.md)），Tauri 桌面壳未在 Windows 打包验证
+- 音乐组件只在 macOS 可用（Windows/Linux 固定返回未在播放）
 - Agent 的「等待输入」是「进程活着但 120 秒没写入」的近似，不是真状态
 - DeepSeek Harness 读不到会话内容，只能显示「运行中」
 - 默认每 200 ms 一次推送循环（时钟秒级）；屏保期间浏览器暂停推帧，由 host 独占

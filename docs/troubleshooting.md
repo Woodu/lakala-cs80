@@ -74,8 +74,8 @@ Windows 上 Quectel 驱动只 open 一个 COM 口，不碰整机配置，所以�
 
 这是最容易误判的一类。屏上的内容来自**桌面 app 窗口里的页面**，而 app 用的是打包副本：
 
-- 打包版：host 服务的是 `CS80 Panel.app/Contents/Resources/panel/web/` 的**拷贝** → 改完 `panel/web/**` 必须
-  `npx tauri build` 重新打包
+- 打包版：host 服务的是 `CS80 Panel.app/Contents/Resources/panel/web/` 的**拷贝** → 改完 `panel/web/**` 要么
+  `rsync -a panel/web/ ".../Resources/panel/web/"`（host.py 改动还要重启 host），要么 `npx tauri build` 重新打包
 - 新增 `web/**` 文件还要同步 `panel/shell/src-tauri/tauri.conf.json` 的 `bundle.resources`（显式列举）
 
 现在有兜底：`/api/status` 带 `build`（web 文件 mtime 汇总），页面发现 `build` 变了会**自己 reload**，
@@ -88,6 +88,9 @@ Windows 上 Quectel 驱动只 open 一个 COM 口，不碰整机配置，所以�
 `panel/qdc1` 独占设备。同时起两个（比如手动 host + 桌面壳自己的 host）会出现「一个能用、一个报错」。
 `panel/run.sh` 和桌面壳启动时都会先 `launchctl bootout com.cs80.panel`；
 手动调试时先 `pkill -f cs80-panel`（壳会拉起自己的 host，也要一起停）。
+
+`host.py` 每次 spawn sidecar 前会 `pkill -f <sidecar 路径>` 清掉上一次 host 被 kill 时留下的孤儿进程
+（macOS 上它握着整机独占，新 sidecar 只会一直报「打不开设备 (code=-1)」）。
 
 ## 屏闪
 
@@ -237,6 +240,9 @@ cs80: full frame retry 1 (raw=0, 3009ms)                          ← 这次之�
 - 新浪 `hq.sinajs.cn` / `stock2.finance.sina.com.cn` **直连正常**。
 - Yahoo `query1.finance.yahoo.com` 直连 403，走本机 mihomo（`127.0.0.1:7890`）才 200。
 
+- 新浪的 `gb_$inx` 里 `$` **不能被 URL 编码**（`%24` 会被当成另一个代码返回空串）；裸 6 位代码要先补 `sh`/`sz`。
+- `host.py` 给东财加了 **60 秒熔断**：失败一次就这段时间不再试，直接把机会让给新浪，免得每条请求都等 6 秒 TLS 握手。
+
 所以 `host.py` 的行情兜底是：
 
 | 数据 | 首选 | 兜底 |
@@ -245,7 +251,7 @@ cs80: full frame retry 1 (raw=0, 3009ms)                          ← 这次之�
 | 外盘期货分时 | 东财 `trends2` | 新浪 `GlobalFuturesMinLine` |
 | A 股分时 | 东财 `trends2` | 新浪 `CN_MarketDataService` |
 | US 指数快照 | 东财 | 新浪 `gb_$inx` / `gb_$ndx` |
-| US 指数分时 | 东财 | 暂缺（新浪该接口已下线；需要时给 host 配 `HTTPS_PROXY` 走 Yahoo） |
+| US 指数分时 | 东财 `trends2` | 新浪 `US_MinlineService.getMinline`（390 点 + 昨收，`100.SPX`→`.INX`） |
 
 快速验证（不用看屏）：
 

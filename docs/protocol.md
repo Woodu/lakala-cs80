@@ -69,7 +69,8 @@
 
 固件 **0.3.0 就带音频**（`HELLO(flags=2)` 的 `detail=0x23f` 里 bit2=文件音频、bit3=PCM），
 PA 使能（QL GPIO22）由固件渲染任务按「播放请求 + speaker 路由 + 非零音量」自动开关，
-主机不需要碰 GPIO。当前只支持 **MP3 文件**（存到设备 `UFS:qdisplay_audio.mp3`，上限 4 MiB）。
+主机不需要碰 GPIO。设备侧只解 **MP3 文件**（存到设备 `UFS:qdisplay_audio.mp3`，上限 4 MiB），
+其它格式由主机用 ffmpeg 转码后再上传。
 
 `type=7` 是空 payload 的控制命令，`flags` 为子命令：
 

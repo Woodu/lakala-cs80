@@ -20,7 +20,7 @@ npx tauri dev            # dev 模式：host 读仓库里的 ../web/，改完刷
 
 ⚠️ **打包版**（.app/.msi）里 host 服务的是 `Resources/panel/web/` 的副本，
 所以改完 `panel/web/*.js` 必须重新 `npx tauri build`，否则窗口里还是旧页面
-（踩过：改了组件却在打包版里看不到，因为 host 跑的是 bundle 内的旧 app.js）。
+（踩过：改了组件却在打包版里看不到，因为 host 跑的是 bundle 内的旧 web 拷贝）。
 
 ## 打包
 
@@ -39,7 +39,7 @@ npx tauri build --no-bundle              # 只要可执行文件（快，验证�
 
 ⚠️ 资源清单是**显式列举**的（`tauri.conf.json` 的 `bundle.resources`）：新增 `panel/web/*.js`、
 换图标、加文档都要同步加进去，否则打包版里 host 找不到文件 → 窗口白屏/只出静态骨架。
-（今天踩的坑：删了 `web/app.js` 却没删资源清单，`tauri build` 直接报 `resource path ... doesn't exist`。）
+（今天踩的坑：删了 `web/` 下某个文件却没删资源清单，`tauri build` 直接报 `resource path ... doesn't exist`。）
 
 ## 环境变量
 

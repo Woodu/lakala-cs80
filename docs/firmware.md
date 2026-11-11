@@ -229,7 +229,7 @@ py\python.exe qdisplay_app.py qdisplay_native_wait.bin --auto
 
 实测（2026-11，本机）：原厂页 50783 B / 415 种颜色 → 新页 **11658 B / 2 种颜色**，
 刷入后 `VERIFY` 回读的 framebuffer 哈希 == 新页面 xxh32，屏上显示
-![新等待页](waiting-page-design.png)。
+![新等待页](assets/waiting-page-design.png)。
 
 > 注意：`HELLO flags=8`（`QD_WAITING_HASH`）是**编进固件的旧页面哈希**，换页面后它不会跟着变，
 > 别拿它当“当前屏上是不是等待页”的判据；要看就用 `VERIFY` 和 `page.meta` 里的 `xxh32` 比。

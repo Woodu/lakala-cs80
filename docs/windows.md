@@ -47,7 +47,7 @@ macOS 侧已经全部实测通过（数字见 [`protocol.md`](protocol.md) §6�
 - 整帧推一屏纯灰后 `VERIFY` 回读 `0x941b9aaa` == 本地整帧 `xxh32` → **像素级一致**
 - 系统指标：CPU 65% / 内存 8.96/15 GB / 网速正常；天气、股票、K 线、Agent 列表都拿到了
 
-![Windows 上跑起来的界面](windows-ui.png)
+![Windows 上跑起来的界面](assets/windows-ui.png)
 
 > 如果局部刷新超过 ~300 ms：那是 `qdc1.c` 在 Windows 上的 `SetCommTimeouts` 没设
 > `ReadIntervalTimeout`（默认值会让每次 ACK 白等 400 ms）。现在已修，重编 `qdc1.exe` 即可。
@@ -211,7 +211,7 @@ npx tauri build --config C:\path\to\winconf.json
 实测（Windows 11 + 本机 CS80）：双击 exe → 自己拉起 `host.py`（用包里的 `panel\py\python.exe`）→ 窗口出现、
 `/api/status` 200、`device=up`。界面长这样：
 
-![Windows 客户端](windows-client.png)
+![Windows 客户端](assets/windows-client.png)
 
 壳的行为（`panel/shell/src-tauri/src/main.rs`）：
 
@@ -253,7 +253,7 @@ npx tauri build --config C:\path\to\winconf.json
 | `patch` 一直 `code=4` | 设备侧 committed 哈希与本机不一致（换过设备/固件重启）→ 点「整帧重推」 |
 | `patch` 报 `too-many-tiles` | 改了布局又同时大量变化 → 客户端会自动改推整帧，不用管 |
 | 整帧很慢（>1 s） | 串口波特率/DTR 设置被驱动改过；确认 115200 8N1、DTR/RTS 关闭（sidecar 已在打开时设置） |
-| 组件里有中文方框 | 画布字体回退到了无中文字体 → 装「微软雅黑」或改 `app.js` 里的 `F()` 字体栈 |
+| 组件里有中文方框 | 画布字体回退到了无中文字体 → 装「微软雅黑」或改 `panel/web/widgets.js` 里的 `FONT` 字体栈 |
 | 数据源拿不到 | 公司网络/代理挡了新浪、东财、open-meteo、GitHub；组件会保留上次值并显示占位 |
 | 刷完 `读回校验不一致` | **已知误报**：`native._read_flash()` 默认 `0x3000` 分块读回不可靠 → `qdisplay_app.py` 已改成 **1 KB 分块**，并会打印差几个字节。真不一致才重刷 |
 | 卡在下载模式、`PDL connect ... no PDL response` | 上一次刷写没复位，设备还停在 **FDL2**（该端口说 BSL，不说 PDL）→ `py\python.exe reset_download.py` 走 BSL 发 `NORMAL_RESET` 重启（不用拔插）；连 BSL 都连不上才断电重上电 |

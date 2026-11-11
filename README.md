@@ -1,17 +1,15 @@
 # 拉卡拉 CS80 客显屏 → Agent 状态副屏
 
-一台 ¥30 的二手「拉卡拉客显屏 CS80」，**不改硬件**（原屏、原主板、原 Type-C/12V 供电，只刷固件），
+一台 ¥39 的「拉卡拉客显屏 CS80」，**不改硬件**（原屏、原主板、原 Type-C/12V 供电，只刷固件），
 改造成 800×1280 的副屏：多画布 + 组件拖拽编辑器 + 自定义页面 + 视频屏保，全部本地、无云依赖。
 
-![参考效果](docs/reference-agent-dashboard.jpg)
+![参考效果](docs/assets/dashboard.jpg)
 
-```
-┌──── 主机（macOS / Windows）────────────┐   USB (Type-C, QDC1)   ┌── CS80 (EC600U) ──┐
-│ 桌面壳（Tauri）→ 浏览器画布 800×1280    │ ───────────────────►  │ 解 LZ4 → framebuffer│
-│  host.py：独占 USB + 本地 HTTP + 数据源 │   整帧 / 局部 tile     │ cache-clean → DSI   │
-│  qdc1（C sidecar）：IOKit / COM        │   BGR565, patch 64 B   │ → SC7705 面板       │
-└────────────────────────────────────────┘                        └─────────────────────┘
-```
+![架构](docs/assets/architecture.png)
+
+一份 canvas 渲染代码同时是编辑器、预览和设备像素源：`host.py` 把浏览器算出来的像素
+按 32×16 tile 差分推给 `qdc1`（独占 USB 的 C sidecar），后者 LZ4 压缩后走 QDC1 协议送到屏上；
+数据源、屏保、音频都在 host 侧，整条链路本地闭环，不依赖任何云服务。
 
 ## 能做什么
 
@@ -23,7 +21,7 @@
 | Agent 状态 | 自动扫描本机 Pi / Claude Code / Codex / DeepSeek Harness 的会话，列表按「运行中 → 等待 → 结束」排序，可逐条隐藏 |
 | 屏保 | 选视频（内置 `wallpaper.mp4`，也可用 `panel/add-screensaver.sh` 转自己的），手动播或锁屏自动播 |
 | 控屏 | 亮度（5–100）、待机/唤醒、设备状态回读 |
-| 喇叭 | 上传 MP3（≤4 MiB）并播放、音量、停止；固件自带音频通路，PA 自动开关 |
+| 喇叭 | 独立「音频播放」面板：任意格式（WAV / FLAC / M4A / OGG / 视频音轨…）→ ffmpeg 转 128 kbps MP3 再上传（≤4 MiB），音量 / 停止 / 播放自愈；固件只解 MP3，转码在主机侧，PLAY 撞到 BAD_STATE 会自动修音频路由后重试 |
 | 自检 | 每帧用 `VERIFY` 回读设备 framebuffer 哈希，patch 链哈希必须对上才算成功 |
 
 ## 一键刷机（新买设备 / 给别人用）
@@ -145,11 +143,13 @@ sudo systemctl enable --now cs80-panel cs80-kiosk
 
 ```
 docs/                文档（硬件 / 固件 / 协议 / 排障 / 走过的死路 / Windows）
+  assets/            文档用图（架构图 .drawio 源 + PNG、默认看板、引脚图、界面截图）
 panel/               客户端：host.py（常驻）+ web/（画布编辑器）+ qdc1.c（USB sidecar）+ shell/（Tauri 壳）
   run.sh             macOS 启动脚本（host + Chrome 应用窗口）
   run-windows.cmd    Windows 启动脚本（host + Edge/Chrome 应用窗口，无需 Rust）
   qdc1_ping.py       QDC1 探活/状态查询（刷机后验证固件跑起来没有）
   flicker_probe.py   屏闪探针：整屏纯色 + 可调重复提交频率
+  kiosk-guard.sh     Linux 无桌面：拉起/守护 headless Chromium 持续推帧
 win-flash/           刷机与恢复工具 + 官方 QuecPython 固件包（新设备必需）
   flash_oneclick.py         一键刷机（判代次 + 备份 + 降级 + 刷 APP + 验证）
   flash/appimg.py            APP2 容器 CRC32（手改固件字节后必须重算）
@@ -157,10 +157,12 @@ win-flash/           刷机与恢复工具 + 官方 QuecPython 固件包（新�
   flash/patch_waiting_page_image.py  把生成的页面换进固件 BIN
   flash/patch_waiting_page.py        0.3.1 等待页倒计时重绘补丁
   flash/reset_download.py    卡在下载模式时用 BSL 复位（不用拔插）
+  flash/flash_at.py          R05 新批次（拉卡拉 1.6）降级到 R03 的基带刷写
   flash/dump_flash.py        整片 8 MiB 备份 / 裸写回滚（降级基带前必做）
   dumps/                     刷机前备份的固件 + 刷机日志（.gitignore，不进仓库）
 一键刷机.cmd       双击即刷（自动解压便携 Python → flash_oneclick.py）
 win-display/         官方 Windows 上位机安装包 + 固件 bin（0.3.0 / 0.3.1）+ 摄像头验证脚本
+deploy/              Linux 部署：udev 规则 + systemd（host / kiosk）
 archive/quecpython/  QuecPython 时代的工具（历史留档，见 docs/dead-ends.md）
 ```
 

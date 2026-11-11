@@ -1122,7 +1122,7 @@ def _plain(symbol):
 
 
 def _sina_cn_code(symbol):
-    """002654 -> sz002654；600641 -> sh600641（新浪只认带前缀的代码）"""
+    """002654 -> sz002654；600519 -> sh600519（新浪只认带前缀的代码）"""
     t = str(symbol).strip().lower()
     if t.startswith(("sh", "sz", "bj")):
         return t

@@ -4,7 +4,7 @@
 
 | 项 | 值 |
 |---|---|
-| 整机 | 拉卡拉 CS80 客显屏音箱（二手 ¥30 级别） |
+| 整机 | 拉卡拉 CS80 客显屏音箱（二手 ¥30 级别 / 新批次 ¥39） |
 | 通信模组 | **Quectel EC600U-CN**（`EC600UCNLC-N05-SNNSA2` / `Q1-C0538`） |
 | 平台 | Unisoc **UIS8910**（Cortex-A5） |
 | 屏幕 | 10.1" **800×1280 竖屏**，16 bpp，MIPI-DSI **2 lane / 60 Hz**，驱动 IC **SC7705** |
@@ -14,7 +14,7 @@
 | 供电 | DC 12V/2A 圆口，或 Type-C（**建议接 12V**，10.1" 背光电流大，纯 Type-C 容易掉线） |
 | 接口 | Type-C（数据+供电）、SIM 卡槽、DC 圆口 |
 
-拆机照、FPC 标注、官方说明书都在 `docs/*.jpg|png|pdf`。
+引脚图见 `docs/assets/ec600u-cn-pinout.png`，官方说明书见 `docs/CS80_readme.pdf`。
 
 ## 2. USB 描述符（决定 macOS 能不能直连）
 
@@ -34,7 +34,7 @@ if32   class 255          bulk OUT 0x08 / IN 0x8b             ← ★ QDC1 数�
 
 ## 3. 引脚
 
-EC600U-CN LCC 关键脚（完整图 `docs/ec600u-cn-pinout.png`）：
+EC600U-CN LCC 关键脚（完整图 `docs/assets/ec600u-cn-pinout.png`）：
 
 | Pin | 名称 | 用途 |
 |---|---|---|
