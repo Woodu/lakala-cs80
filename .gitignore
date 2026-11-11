@@ -54,6 +54,7 @@ panel/py/
 win-flash/flash/py/
 win-flash/flash/tmp.zip
 win-flash/flash/*.tmp
+win-flash/dumps/
 
 # ---- 刷机时生成的固件变体（脚本随时可重建）----
 win-flash/flash/*.bin

@@ -9,6 +9,13 @@
 import sys
 import time
 
+try:  # Windows 控制台是 GBK 时，print 里的 ✗/✓ 会直接抛 UnicodeEncodeError
+    sys.stdout.reconfigure(errors="replace")
+except Exception:
+    pass
+
+sys.path.insert(0, ".")  # 便携版 (python3xx._pth) 不含脚本目录，必须先插进来
+
 import serial
 import serial.tools.list_ports as lp
 
