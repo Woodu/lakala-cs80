@@ -1121,7 +1121,19 @@ def _plain(symbol):
     return str(symbol).lower().replace("sh", "").replace("sz", "").replace("bj", "").replace(".", "")
 
 
+def _sina_cn_code(symbol):
+    """002654 -> sz002654；600641 -> sh600641（新浪只认带前缀的代码）"""
+    t = str(symbol).strip().lower()
+    if t.startswith(("sh", "sz", "bj")):
+        return t
+    if t.isdigit() and len(t) == 6:
+        return ("sh" if t[0] in "569" else "sz") + t
+    return t
+
+
 def _sina_quote(symbol):
+    symbol0 = str(symbol)
+    symbol = _sina_cn_code(symbol0)
     url = "https://hq.sinajs.cn/list=" + urllib.parse.quote(symbol)
     req = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
@@ -1137,7 +1149,7 @@ def _sina_quote(symbol):
     else:
         name, price, prev = f[0], float(f[3]), float(f[2])
     return {
-        "symbol": symbol,
+        "symbol": symbol0,
         "name": name,
         "price": price,
         "prev": prev,
@@ -1150,10 +1162,18 @@ def _sina_quote(symbol):
 SINA_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
 
 
-def _sina_http(url, timeout=8):
-    req = urllib.request.Request(url, headers=SINA_HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("gbk", "replace")
+def _sina_http(url, timeout=10, retries=1):
+    """新浪的行情接口偶发读超时（尤其美股分时），失败重试一次再往上抛。"""
+    last = None
+    for _ in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=SINA_HEADERS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("gbk", "replace")
+        except Exception as exc:
+            last = exc
+            time.sleep(0.4)
+    raise last
 
 
 def _sina_foreign_id(symbol):
@@ -1177,7 +1197,8 @@ def _sina_foreign_quote(symbol):
     qid, _fut = _sina_foreign_id(symbol)
     if not qid:
         raise RuntimeError("新浪不支持这个代码")
-    text = _sina_http("https://hq.sinajs.cn/list=" + urllib.parse.quote(qid))
+    # 注意：gb_$inx 里的 $ 不能编码（%24 会被新浪当成另一个不存在的代码，返回空串）
+    text = _sina_http("https://hq.sinajs.cn/list=" + urllib.parse.quote(qid, safe="$"))
     m = re.search(r'="([^"]*)"', text)
     if not m or not m.group(1):
         raise RuntimeError("新浪无数据")
@@ -1224,6 +1245,34 @@ def _sina_foreign_minute(symbol):
     return {"symbol": symbol, "preClose": pre, "points": points, "source": "sina"}
 
 
+def _sina_us_minute(symbol):
+    """美股指数分时兜底：新浪 US_MinlineService（东财 trends2 挂掉时用）。
+    minline_1[0].first_min = [日期, 时间, 昨收, 开盘, ...]，other_min = [[价格, 量], ...]"""
+    m = re.match(r"^100\.(SPX|NDX|DJI|DJIA)$", str(symbol).strip(), re.I)
+    if not m:
+        raise RuntimeError("这个外盘代码没有分时源")
+    code = {"SPX": ".INX", "NDX": ".NDX", "DJI": ".DJI", "DJIA": ".DJI"}[m.group(1).upper()]
+    text = _sina_http(
+        "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var%20t=/"
+        "US_MinlineService.getMinline?symbol=" + code
+    )
+    a, b = text.find("("), text.rfind(")")
+    if a < 0 or b <= a:
+        raise RuntimeError("新浪分时格式异常")
+    obj = json.loads(text[a + 1:b])
+    block = (obj.get("minline_1") or [{}])[0] if isinstance(obj.get("minline_1"), list) else {}
+    first = block.get("first_min") or []
+    rows = block.get("other_min") or []
+    if len(rows) < 2:
+        raise RuntimeError("没有分时数据")
+    pre = float(first[2]) if len(first) > 2 else float(rows[0][0])
+    points = []
+    for i, row in enumerate(rows):
+        mm = 570 + i  # 美东 9:30 开盘，按分钟推时间（只用来排序/对齐，不画刻度）
+        points.append(["%02d:%02d" % (mm // 60, mm % 60), float(row[0])])
+    return {"symbol": symbol, "preClose": pre, "points": points, "source": "sina"}
+
+
 def _sina_cn_minute(symbol):
     """A 股分时兜底：新浪 CN_MarketDataService（东财 trends2 挂掉时用）。"""
     sym = str(symbol).lower().replace(".", "")
@@ -1252,13 +1301,29 @@ def _sina_cn_minute(symbol):
     return {"symbol": symbol, "preClose": pre, "points": points, "source": "sina"}
 
 
+_EM_DOWN = {"until": 0.0}
+
+
+def _em_json(url):
+    """东财接口统一入口：失败一次就熔断 60 秒（这台机器上 push2* 经常直接 Empty reply，
+    每次重试都要卡几秒 TLS 握手，连带把 portfolio 拖慢）。"""
+    left = _EM_DOWN["until"] - time.time()
+    if left > 0:
+        raise RuntimeError("东财暂不可用（%.0fs 后重试）" % left)
+    try:
+        return http_json(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
+    except Exception:
+        _EM_DOWN["until"] = time.time() + 60
+        raise
+
+
 def _em_quote(symbol):
     """东财快照（A 股走 push2，外盘/期货走 push2delay，后者没有 302 拦截）"""
     fields = "f43,f44,f45,f46,f57,f58,f60,f169,f170"
     host = "push2delay" if _is_foreign(symbol) else "push2"
     url = "https://%s.eastmoney.com/api/qt/stock/get?invt=2&secid=%s" \
           "&ut=fa5fd1943c7b386f172d6893dbfba10b&fields=%s" % (host, _secid(symbol), fields)
-    d = http_json(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
+    d = _em_json(url)
     data = d.get("data") or {}
     if not data:
         raise RuntimeError("东财无数据")
@@ -1353,7 +1418,7 @@ def kline(symbol, limit=60):
         "&ut=fa5fd1943c7b386f172d6893dbfba10b&fields1=f1,f2,f3,f4,f5,f6"
         "&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&end=20500101&lmt=%d"
     ) % (_secid(symbol), limit)
-    d = http_json(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
+    d = _em_json(url)
     data = d.get("data") or {}
     rows = data.get("klines") or []
     if not rows:
@@ -1401,7 +1466,7 @@ def minute(symbol):
             "&ut=fa5fd1943c7b386f172d6893dbfba10b&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
             "&fields2=f51,f53&iscr=0&ndays=1"
         ) % _secid(symbol)
-        d = http_json(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
+        d = _em_json(url)
         data = d.get("data") or {}
         trends = data.get("trends") or []
         if not trends:
@@ -1420,7 +1485,10 @@ def minute(symbol):
     except Exception:
         # 东财被墙/限流时用新浪：外盘走 GlobalFuturesMinLine，A 股走 CN_MarketDataService
         if _is_foreign(symbol):
-            return _sina_foreign_minute(symbol)
+            try:
+                return _sina_foreign_minute(symbol)
+            except Exception:
+                return _sina_us_minute(symbol)
         return _sina_cn_minute(symbol)
 
 
