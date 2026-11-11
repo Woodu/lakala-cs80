@@ -26,8 +26,39 @@
 | 喇叭 | 上传 MP3（≤4 MiB）并播放、音量、停止；固件自带音频通路，PA 自动开关 |
 | 自检 | 每帧用 `VERIFY` 回读设备 framebuffer 哈希，patch 链哈希必须对上才算成功 |
 
+## 一键刷机（新买设备 / 给别人用）
+
+不用看文档、不用装 Python：**把设备插好，双击仓库根目录的 `一键刷机.cmd`**。
+
+前置就三样：**Windows 10/11 x64** + **能传数据的 Type-C 线** + **DC 12V/2A 电源**。
+（缺 Quectel USB 驱动时脚本会自己解压 `quectel-usb-driver.zip` 并弹一次 UAC 代装；
+便携 Python 首次运行会自动解压到 `win-flash/flash/py/`，已经随仓库带着。）
+
+它会先探设备，再按实际情况选路：
+
+| 设备当前状态 | 脚本动作 | 耗时 |
+|---|---|---|
+| 已经是 QDisplay（QDC1 应答） | 只报 `block` / `features`，不动它 | 5 s |
+| R03 基带（`…03A04M08_OCPU_QPY`） | 只写 APP 分区 | ~30 s |
+| R05 / 拉卡拉 1.6 出厂（`…05A01M08_OPU_BETA1215`） | 整片 8 MiB 备份 → 刷 `fw.pac` 降到 R03 → 再写 APP | ~15 min |
+| 完全没设备 / Error 43 | 打印「线 / 供电 / 驱动 / HUB」四步排查，缺驱动可代装 | — |
+
+命令行等价写法（不想双击时用）：
+
+```bat
+cd win-flash\flash
+py\python.exe flash_oneclick.py --dry-run   :: 只看诊断和计划，不动设备
+py\python.exe flash_oneclick.py             :: 刷（刷前确认一次）
+py\python.exe flash_oneclick.py --yes       :: 全自动
+```
+
+刷完看画面：`panel\run-windows.cmd`，或直接双击打包好的 `cs80-panel.exe`。
+日志与原厂备份都在 `win-flash/dumps/`（备份的才是刷机前那一份，别删）。
+细节见 [`docs/firmware.md`](docs/firmware.md) §0.6；为什么要先降级见 §0.5。
+
 ## 买第二台设备怎么接（10 步）
 
+> 只想把设备刷成副屏：直接用上面的 `一键刷机.cmd`，下面 10 步是手工版/排障用。
 > 全流程只在 **Windows + macOS** 走通过；刷机只有 Windows 能做（macOS 上 BootROM 口被拒）。
 
 1. **确认是同款**：主板丝印 `CS80 MB V10`，屏 FPC `H.101.001B02`，模组 `EC600UCNLBR03A04M08`。
@@ -120,13 +151,15 @@ panel/               客户端：host.py（常驻）+ web/（画布编辑器）+
   qdc1_ping.py       QDC1 探活/状态查询（刷机后验证固件跑起来没有）
   flicker_probe.py   屏闪探针：整屏纯色 + 可调重复提交频率
 win-flash/           刷机与恢复工具 + 官方 QuecPython 固件包（新设备必需）
+  flash_oneclick.py         一键刷机（判代次 + 备份 + 降级 + 刷 APP + 验证）
   flash/appimg.py            APP2 容器 CRC32（手改固件字节后必须重算）
   flash/make_waiting_page.py 生成等待页（纯黑白，不闪）
   flash/patch_waiting_page_image.py  把生成的页面换进固件 BIN
   flash/patch_waiting_page.py        0.3.1 等待页倒计时重绘补丁
   flash/reset_download.py    卡在下载模式时用 BSL 复位（不用拔插）
   flash/dump_flash.py        整片 8 MiB 备份 / 裸写回滚（降级基带前必做）
-  dumps/                     刷机前备份的固件（.gitignore，不进仓库）
+  dumps/                     刷机前备份的固件 + 刷机日志（.gitignore，不进仓库）
+一键刷机.cmd       双击即刷（自动解压便携 Python → flash_oneclick.py）
 win-display/         官方 Windows 上位机安装包 + 固件 bin（0.3.0 / 0.3.1）+ 摄像头验证脚本
 archive/quecpython/  QuecPython 时代的工具（历史留档，见 docs/dead-ends.md）
 ```

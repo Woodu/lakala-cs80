@@ -115,6 +115,39 @@ py\python.exe dump_flash.py --restore ..\..\dumps\full_flash_0x60000000_8MiB_<sh
 | `READ_FLASH` 大 chunk 静默回空 | 读速基准显示 55 MB/s，dump 出来 **0 字节** | `chunk` 只用到 `0x8000`，而且每条读都要校验返回长度（`dump_flash.py` 已做） |
 | 只备份 APP 分区 | 原厂 APP 已覆盖后才发现格式不是 APP2，救不回来 | 降级/换固件之前一律先整片 8 MiB dump |
 
+## 0.6 一键刷机（给「不想看文档」的人）
+
+上面 §0.5 的整套人工流程已包成脚本：**双击仓库根目录的 `一键刷机.cmd`**。
+它自己判断代次、要不要降级、要不要备份，然后一路刷完并验证。
+
+```bat
+一键刷机.cmd                              :: 双击即可（首次会自动解压便携 Python）
+cd win-flash\flash
+py\python.exe flash_oneclick.py --dry-run  :: 只诊断 + 打印计划，不动设备
+py\python.exe flash_oneclick.py            :: 刷（刷前确认一次）
+py\python.exe flash_oneclick.py --yes      :: 全自动（不确认）
+py\python.exe flash_oneclick.py --force    :: 已刷过也强制重刷
+```
+
+| 设备状态 | 脚本动作 | 耗时 |
+|---|---|---|
+| 已经是 QDisplay（QDC1 应答） | 只报状态（`block` / `features`），不动它 | 5 s |
+| R03 基带（`…03A04M08_OCPU_QPY`） | 只写 `0x60260000` 的 APP 分区（同 §1） | ~30 s |
+| R05 / 拉卡拉 1.6 出厂（`…05A01M08_OPU_BETA1215`） | 整片备份 → 刷 `fw.pac` → 刷新固件 → 写 APP（同 §0.5） | ~15 min |
+| 在下载模式、拿不到版本号 | 读 flash 头部判代次（`2PPA` 才算 R03 系） | — |
+| 完全找不到设备 | 打印排查四步；摸到模组但无 COM 口时代装 Quectel 驱动（UAC） | — |
+
+脚本自己的保险：
+
+- 刷机前先关掉桌面壳 / `qdc1.exe`（它们会抢 COM 口导致探活误判成「未刷」）；
+- R05 路径**默认先做整片 8 MiB 备份**，备份失败就拒绝继续（`--no-backup` 可关，不建议）；
+- 固件 bin 的 APP2 `crc32@8` 不对直接拒绝刷；写 APP 后强制 1 KB 分块读回比对；
+- 每步都可重入：中途拔线/失败，重插后再跑一次即可（已刷过的步骤会自动跳过）；
+- 日志落在 `win-flash/dumps/flash-YYYYmmdd-HHMMSS.log`，原厂备份也在同目录。
+
+> 别人买新设备、在自己电脑上刷：只需要 Windows 10/11 + 能传数据的 Type-C 线 + DC 12V。
+> 仓库里已带齐 `python-embed.zip`（11 MB）、`pyserial.whl`、`quectel-usb-driver.zip`（41 MB）、`fw.pac`（6.5 MB）。
+
 ---
 
 ## 1. 刷 QDisplay（只写 APP 分区，不格式化、不动 NV）
@@ -242,6 +275,7 @@ win-flash/
     ├── qdisplay_app.py                刷 QDisplay APP（写 0x60260000）
     ├── flash_at.py                    刷回 QuecPython（整包 + 格式化）
     ├── dump_flash.py                  整片备份 / 裸写回滚（降级、改基带前必做）
+    ├── flash_oneclick.py              一键刷机（判代次 + 备份 + 降级 + 刷 APP + 验证）
     ├── fw.pac                         官方 PAC
     ├── third_party/sprdflash/         纯 Python 刷写器（PDL/FDL over libusb）
     ├── quectel-usb-driver.zip         Windows USB 驱动
