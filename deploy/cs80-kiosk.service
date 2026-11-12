@@ -7,6 +7,9 @@ Wants=cs80-panel.service
 Type=simple
 Environment=HOME=/root
 Environment=PORT=8787
+# Chromium 的 renderer 会随 canvas/getImageData 缓慢泄漏 shared memory fd；
+# 默认 soft 1024 大约 2 小时就 EMFILE（Too many open files）→ 页面推帧停住。
+LimitNOFILE=1048576
 ExecStart=/root/lakala-cs80/panel/kiosk-guard.sh
 Restart=always
 RestartSec=3

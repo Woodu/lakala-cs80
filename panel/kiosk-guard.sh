@@ -11,11 +11,30 @@ set -u
 DIR=$(cd "$(dirname "$0")" && pwd)
 PORT=${PORT:-8787}
 BEAT_MAX=${BEAT_MAX:-30}
+# renderer 的 shared memory fd 泄漏到一定量就主动重启，别等 EMFILE 把页面冻住
+FD_MAX=${FD_MAX:-8000}
+RSS_MAX_KB=${RSS_MAX_KB:-1572864}
 BIN=${CS80_CHROME:-/root/.cache/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell}
 PROFILE=${CS80_KIOSK_PROFILE:-/var/lib/cs80-kiosk}
 URL="http://127.0.0.1:${PORT}/?kiosk=1"
 
 log() { echo "cs80-kiosk: $*" >&2; }
+
+# renderer 的 fd / RSS 检查：页面可能「进程活着、心跳还在、推帧已经停了」
+# （EMFILE / shm 泄漏）。心跳判断不出来，直接看 renderer 的资源。
+check_renderer() {
+  G=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+  [ -z "$G" ] && return 0
+  R=$(ps -eo pid=,pgid=,args= | awk -v g="$G" '$2 == g && /--type=renderer/ {print $1; exit}')
+  [ -z "$R" ] && return 0
+  FDS=$(ls "/proc/$R/fd" 2>/dev/null | wc -l | tr -d ' ')
+  RSS=$(ps -o rss= -p "$R" 2>/dev/null | tr -d ' ')
+  if [ "${FDS:-0}" -ge "$FD_MAX" ] || [ "${RSS:-0}" -ge "$RSS_MAX_KB" ]; then
+    log "renderer pid=$R fds=$FDS rss=${RSS}KB 超过阈值，重启 Chromium"
+    return 1
+  fi
+  return 0
+}
 
 # Chromium 的 renderer/gpu/zygote 是子孙进程，只 kill 主进程会留下孤儿（占着 profile
 # 还可能继续往 host 推帧）。按 --user-data-dir 精确清理。
@@ -71,6 +90,10 @@ while :; do
     fi
     if [ "$BAD" -ge 2 ]; then
       log "页面心跳停了 ${AGE}s（页面被冻结？），重启 Chromium"
+      kill_chrome "$PID"
+      break
+    fi
+    if ! check_renderer; then
       kill_chrome "$PID"
       break
     fi
