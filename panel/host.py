@@ -596,6 +596,18 @@ class Device:
             except Exception:
                 pass
 
+    def flush_pending(self):
+        """整帧是完整快照：入队前把还没发出去的旧 patch 全丢掉。
+        否则设备卡在 patch 重试里时，整帧要排在 3~4 条 patch 后面（每条可能 9 s），
+        屏上「等待连接」会拖很久。"""
+        with self._q_lock:
+            while True:
+                try:
+                    _sess, payload = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                self._q_bytes -= len(payload)
+
     def _spawn(self):
         # 同时只能有一个 sidecar 持有 USB：先确认旧的已经退出，否则 Windows 上两个句柄
         # 会同时打开同一个 CDC 口 → 回包被抢走，看起来就是“时通时不通/卡住”。
@@ -648,9 +660,10 @@ class Device:
         # 让 sidecar 直接跳过 LZ4（只在 Linux/sysfs 能读到 speed 时做）。
         env = None
         if os.name != "nt":
-            info = usb_link_info()
-            if info and 0 < (info.get("speed") or 0) < 480:
-                env = dict(os.environ, CS80_RAW_FULL="1")
+            # 固件的整帧 LZ4 解码对某些块会卡 3 s（status=8），随后 patch 也会跟着超时；
+            # 整帧现在只在重连/出错时发（60 分钟兜底），裸块 2 MB 在 480 Mbps 上约 0.2 s，
+            # 直接跳过 LZ4 更稳。
+            env = dict(os.environ, CS80_RAW_FULL="1")
         try:
             self.proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, bufsize=0, env=env
@@ -706,7 +719,7 @@ class Device:
                         self.status = dict(self.status, needs_replug=False)
                 else:
                     self.fail_streak += 1
-                    if self.fail_streak >= 6:
+                    if self.fail_streak >= 3:
                         self.status = dict(self.status, needs_replug=True)
             elif name in ("brightness", "power", "state"):
                 self.status = dict(self.status, **{name: {k: v for k, v in ev.items() if k != "event"}})
@@ -2644,6 +2657,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(n)
             if len(body) != n or len(body) != 800 * 1280 * 3:
                 return self._send(400, {"error": "frame must be %d bytes, got %d" % (800 * 1280 * 3, len(body))})
+            self.device.flush_pending()  # 整帧覆盖全屏，旧 patch 没有意义
             ok = self.device.send(b"\x01" + body)
             PUSH["at"] = time.time()
             if ok:

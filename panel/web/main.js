@@ -310,9 +310,9 @@ async function boot() {
   const tick = () => {
     if (!saver.active) renderAll();
     if (pusher.interacting) return; // 拖动中不推帧（见 editor.js）
-    // 60 s 一次的整帧兜底在 USB 全速（12 Mbps）下就是每分鐘冻结 1.5~2.5 s；
-    // patch 链本身有 base/target 哈希校验，只有出错时才会 markFull，所以改 10 分钟。
-    if (Date.now() - lastFullPush > 600000 && !saver.active) {
+    // 周期整帧只是兜底：patch 链有 base/target 哈希校验，出错会 markFull；
+    // 整帧会触发固件重绘/可能的 LZ4 坑，拉长到 60 分钟，减少屏上「等待连接」的次数。
+    if (Date.now() - lastFullPush > 3600000 && !saver.active) {
       pusher.markFull();
       lastFullPush = Date.now();
     }

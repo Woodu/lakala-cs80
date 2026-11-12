@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -104,6 +105,17 @@ static link_t_fwd *g_link;
 static void json(const char *fmt, ...);
 
 static void on_signal(int sig) { (void)sig; stop = 1; }
+
+/* 带时间戳的 stderr 日志：排查「隔一阵断一次」时要和 host/内核日志对时间 */
+static void tlog(const char *fmt, ...) {
+  time_t t = time(NULL);
+  struct tm *tm = localtime(&t);
+  if (tm) fprintf(stderr, "%02d:%02d:%02d ", tm->tm_hour, tm->tm_min, tm->tm_sec);
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+}
 
 /* ---------- XXH32（与固件 Hash32 一致，seed 0）---------- */
 static uint32_t rd32(const void *p) {
@@ -193,7 +205,7 @@ static int open_link(link_t *l, int iface_number) {
   char path[128];
   l->fd = -1;
   if (find_device(path, sizeof path)) {
-    fprintf(stderr, "cs80: 找不到 2c7c:0901 设备\n");
+    tlog("cs80: 找不到 2c7c:0901 设备\n");
     return -1;
   }
   int fd = open(path, O_RDWR | O_CLOEXEC);
@@ -226,7 +238,7 @@ static int open_link(link_t *l, int iface_number) {
     l->fd = -1;
     return -4;
   }
-  fprintf(stderr, "cs80: %s if%d ep_out=0x%02x ep_in=0x%02x\n", path, iface_number, l->ep_out, l->ep_in);
+  tlog("cs80: %s if%d ep_out=0x%02x ep_in=0x%02x\n", path, iface_number, l->ep_out, l->ep_in);
   /* 清掉上一轮进程遗留的迟到 ACK，避免新会话第一个命令读到旧 seq。 */
   for (int i = 0; i < 32; i++) {
     uint8_t junk[256];
@@ -487,7 +499,7 @@ static uint32_t reply_body[6];
 static void link_lost(const char *reason) {
   /* 带上固件回的状态码：0=OK（说明只是我们没等到）1..8 见 docs/protocol.md，
    * 其中 8 = 设备接收超时（数据没在 3 s 内收全，常见于内容太大被丢弃）。 */
-  fprintf(stderr, "cs80: 链路丢失 (%s, status=%u)\n", reason, reply_body[0]);
+  tlog("cs80: 链路丢失 (%s, status=%u)\n", reason, reply_body[0]);
   json("{\"event\":\"lost\",\"reason\":\"%s\"}", reason);
   if (g_link) close_link(g_link);
   exit(3);
@@ -606,7 +618,7 @@ static int push_full_once(link_t *l, int raw_mode, uint32_t *wire, uint32_t *ms)
     if (send_cmd(l, QD_DATA, raw_mode ? 0 : 1, off, n, payload, clen)) return -1;
     if (wait_ack(l, l->seq, 3) || reply_body[0]) {
       /* 失败时把这块的大小打出来：块序号 / 未压缩 / 实际发出 / 设备状态码 */
-      fprintf(stderr, "cs80: data fail block=%u raw=%u clen=%u status=%u mode=%s\n",
+      tlog("cs80: data fail block=%u raw=%u clen=%u status=%u mode=%s\n",
               off / BLOCK_BYTES, n, clen, reply_body[0], raw_mode ? "raw" : "lz4");
       if (!raw_mode) {
         remember_bad(xxh32((const uint8_t *)fbuf + off, n));
@@ -640,7 +652,7 @@ static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
     int r = push_full_once(l, raw_mode, wire, ms);
     if (r == 0) return 0;
     if (r < 0) break;
-    fprintf(stderr, "cs80: full frame retry %d (raw=%d, %.0fms)\n", attempt + 1, raw_mode, now_ms() - t_attempt);
+    tlog("cs80: full frame retry %d (raw=%d, %.0fms)\n", attempt + 1, raw_mode, now_ms() - t_attempt);
     sleep_ms(300);
   }
   link_lost("no-ack-data");
@@ -697,7 +709,7 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   /* 设备偶尔会「收完命令但 3 s 才回 status=8（接收超时）」——固件那一刻在忙绘制。
    * 对同一个 patch 原地重试（base 哈希没变，设备也没应用），比立刻让前端推 2 MB 整帧便宜得多。 */
   int rc = -7, attempt = 0;
-  for (; attempt < 3; attempt++) {
+  for (; attempt < 2; attempt++) {  /* 1 次重试；再失败就交给整帧复位 */
     if (attempt) sleep_ms(250);
     if (send_cmd(l, QD_PATCH, 1, fbuf_hash, raw_len, comp, (uint32_t)clen)) link_lost("write-patch");
     if (wait_ack(l, l->seq, ACK_TRIES)) link_lost("no-ack-patch");
@@ -709,16 +721,16 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
     }
     /* 4=base 哈希不对 / 3=哈希错：重试也没用，直接交给整帧 */
     if (reply_body[0] != 8 && reply_body[0] != 5) break;
-    fprintf(stderr, "cs80: patch retry %d (status=%u tiles=%u)\n", attempt + 1, reply_body[0], count);
+    tlog("cs80: patch retry %d (status=%u tiles=%u)\n", attempt + 1, reply_body[0], count);
   }
   *wire = (uint32_t)clen + 32;
   *ms = (uint32_t)(now_ms() - t0);
   if (*ms > 500)  /* 设备偶尔 2~3 s 才回 ACK：留证据（4=base 哈希不对，8=接收超时） */
-    fprintf(stderr, "cs80: slow patch ack %ums status=%u tiles=%u\n", *ms, reply_body[0], count);
+    tlog("cs80: slow patch ack %ums status=%u tiles=%u\n", *ms, reply_body[0], count);
   if (rc == 0) {
     if (reply_body[5] && reply_body[5] != target) {
       /* 设备上的 framebuffer 和设备自己算的哈希对不上：影子已不可信，整帧重来 */
-      fprintf(stderr, "cs80: patch hash mismatch device=%#x shadow=%#x\n", reply_body[5], target);
+      tlog("cs80: patch hash mismatch device=%#x shadow=%#x\n", reply_body[5], target);
       fbuf_valid = 0;
       return -8;
     }
@@ -870,7 +882,7 @@ int main(int argc, char **argv) {
   memset(&l, 0, sizeof l);
   int rc = open_link(&l, iface);
   if (rc) {
-    fprintf(stderr, "cs80: 打不开设备 (code=%d)。检查上电/固件/驱动\n", rc);
+    tlog("cs80: 打不开设备 (code=%d)。检查上电/固件/驱动\n", rc);
     return 1;
   }
   g_link = &l;
