@@ -51,7 +51,7 @@ shell/                      Tauri 2 壳（见 shell/README.md）
 add-screensaver.sh          把任意视频转成 800×1280 / 12 fps 放进屏保目录
 ```
 
-## 组件（16 个）
+## 组件（17 个）
 
 数据有两层缓存：host 侧按源缓存（股票 15s / 资讯 180s…），浏览器侧把 `state.data` 落到
 `localStorage`（单组件 ≤200 KB）→ **换面板、重开窗口先用旧数据画出来**（组件右上角标 `22:52 更新`），
@@ -78,6 +78,45 @@ add-screensaver.sh          把任意视频转成 800×1280 / 12 fps 放进屏�
 | 便签 | 1×1 | 纯文本 |
 | 资讯 | 3×2 | 热榜（接口照 newsnow，共 12 个源）：今日头条 / 百度 / 知乎 / 微博 / 贴吧 / V2EX / 掘金 / 少数派 / IT之家 / 36氪 / 华尔街见闻 / Hacker News。属性面板里**勾选启用、↑↓ 调 Tab 顺序、输入框改 Tab 名字**（如「今日头条」→「头条」），`rotate` 秒数轮播；行数由高度决定；右上角小字 `22:52 更新`（全挂了才变「更新失败·重取中」，数据仍保留） |
 | 假期 | 1×1 | 下一个假期倒计时（数据照 holiday-cn，按国务院公布的调休表）；四种版式按宽高自动切：宽扁=大数字 / 竖版=假期列表 / 方形=名字+大数字 / 大卡=左边大数字+右边后续假期 |
+| Home Assistant | 5×2 / 2×2 | 本地 HA REST API：室内温度/湿度、室外天气、空调、灯/开关、门窗/门锁、功率、媒体；token 在 `~/.cs80_panel/config.json`，浏览器只拿 entity_id 的 state。见下 |
+
+### Home Assistant 概览
+
+`host.py` 读 `~/.cs80_panel/config.json` 的 `ha`（或环境变量 `HA_URL` / `HA_TOKEN`）：
+
+```json
+{
+  "ha": {
+    "url": "http://127.0.0.1:8123",
+    "token": "HA 长期访问令牌"
+  }
+}
+```
+
+token 用 HA「个人资料 → 安全 → 长期访问令牌」创建，建议命名 `cs80-panel`；只存 host，不要写进
+layout.json。组件 config 只放 entity_id：
+
+```json
+{
+  "title": "家里",
+  "temp": "sensor.xxx_temperature",
+  "humidity": "sensor.xxx_humidity",
+  "air": "weather.xxx",
+  "climate": "climate.xxx",
+  "lights": "light.a,light.b",
+  "switches": "switch.a,switch.b",
+  "doors": "binary_sensor.a,binary_sensor.b",
+  "lock": "lock.xxx",
+  "power": "sensor.xxx_power",
+  "energy": "sensor.xxx_energy",
+  "media": "media_player.xxx",
+  "chips": "climate,lights,switches,media"
+}
+```
+
+`air` 可以是 `sensor`（PM2.5/CO2）也可以是 `weather`（显示室外温度 + 天气）。
+`chips` 决定中间状态条显示哪些角色；没配实体或实体 `unavailable` 会显示 `—`/灰色，HA 离线时
+保留上一次数据、右上角变红。
 
 ## 默认看板（新装即用）
 

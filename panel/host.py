@@ -8,7 +8,7 @@
 职责边界：
   - 唯一持有 panel/qdc1 sidecar（USB 独占），把帧/局部更新/控屏转给它
   - 存布局 ~/.cs80_panel/layout.json
-  - 抓数据（系统指标 / agent / 天气 / 行情 / 热榜 / 假期），带缓存，组件只读缓存
+  - 抓数据（系统指标 / agent / 天气 / 行情 / 热榜 / 假期 / Home Assistant），带缓存，组件只读缓存
 不负责画像素：像素由浏览器画布算出来再 POST 进来（路线 A：一份渲染代码即编辑器又是设备像素源）。
 """
 import argparse
@@ -2407,6 +2407,77 @@ def agent_state():
     return st
 
 
+# ---------------- Home Assistant ----------------
+# HA 只在家里局域网/本机跑：token 放在 ~/.cs80_panel/config.json 的 ha.token，
+# 或环境变量 HA_URL / HA_TOKEN。浏览器只拿到白名单实体的 state，拿不到 token。
+HA_ATTRS = (
+    "friendly_name", "unit_of_measurement", "device_class", "state_class",
+    "hvac_action", "current_temperature", "temperature", "fan_mode",
+    "brightness", "media_title", "media_artist", "volume_level", "is_volume_muted",
+    "battery_level", "entity_id", "humidity", "wind_speed", "cloud_coverage",
+)
+HA_DOMAINS = {
+    "sensor", "binary_sensor", "light", "switch", "climate", "lock", "media_player",
+    "weather", "fan", "vacuum", "cover", "alarm_control_panel", "person", "input_boolean",
+}
+
+
+def ha_states(ids):
+    """按 entity_id 读 HA 状态；只返回组件需要的字段，token 不出 host。"""
+    cfg = load_config().get("ha") or {}
+    url = (os.environ.get("HA_URL") or cfg.get("url") or "").strip().rstrip("/")
+    token = (os.environ.get("HA_TOKEN") or cfg.get("token") or "").strip()
+    if not url or not token:
+        raise RuntimeError("HA 未配置：~/.cs80_panel/config.json 的 ha.url / ha.token")
+
+    wanted = []
+    for eid in ids:
+        eid = eid.strip()
+        if not re.match(r"^[a-z_]+\.[a-z0-9_]+$", eid):
+            continue
+        if eid.split(".", 1)[0] not in HA_DOMAINS:
+            continue
+        if eid not in wanted:
+            wanted.append(eid)
+    if not wanted:
+        raise RuntimeError("HA 实体为空")
+
+    headers = {"Authorization": "Bearer " + token, "User-Agent": "cs80-panel/1.0"}
+
+    def one(eid):
+        try:
+            return eid, http_json(url + "/api/states/" + urllib.parse.quote(eid), headers=headers, timeout=4), None
+        except Exception as exc:
+            return eid, None, str(exc)
+
+    # 并发拉：HA 某一台设备/一条实体超时不能把整个组件拖住（顺序拉 8 条最坏 32 s）。
+    with ThreadPoolExecutor(max_workers=min(8, len(wanted))) as pool:
+        results = list(pool.map(one, wanted[:32]))
+
+    items = {}
+    errors = []
+    for eid, st, err in results:
+        if st is None:
+            items[eid] = {"id": eid, "state": "unavailable", "domain": eid.split(".", 1)[0],
+                          "error": (err or "timeout")[:120]}
+            errors.append(err or "timeout")
+            continue
+        attrs = st.get("attributes") or {}
+        items[eid] = {
+            "id": eid,
+            "name": attrs.get("friendly_name") or eid,
+            "state": st.get("state"),
+            "unit": attrs.get("unit_of_measurement") or "",
+            "domain": eid.split(".", 1)[0],
+            "device_class": attrs.get("device_class") or "",
+            "attributes": {k: attrs[k] for k in HA_ATTRS if k in attrs},
+            "changed": st.get("last_changed"),
+        }
+    if not any(v.get("state") != "unavailable" for v in items.values()):
+        raise RuntimeError(errors[0] if errors else "HA 无响应")
+    return {"online": True, "items": items, "updated": time.time()}
+
+
 # ---------------- HTTP ----------------
 def load_layout():
     try:
@@ -2556,6 +2627,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/data/system":
             # 0.9s 缓存：多个组件共用一次采样，网速差分才有固定 dt
             return self._send(200, CACHE.get("sys", 0.9, system_metrics))
+        if path == "/api/data/ha":
+            ids = [x.strip() for x in (qs.get("entities") or [""])[0].split(",") if x.strip()]
+            if not ids:
+                return self._send(200, {"online": False, "error": "未配置 HA 实体", "items": {}})
+            key = "ha:" + ",".join(sorted(set(ids)))
+            return self._send(200, CACHE.get(key, 2.5, lambda: ha_states(ids)))
         if path == "/api/data/agent":
             return self._send(200, agent_state())
         # 静态文件

@@ -26,6 +26,20 @@ const FIELDS = {
   timer: [['label', '名称'], ['time', '到点时间 HH:MM']],
   note: [['text', '文字']],
   news: [['rotate', '自动切换秒数']],
+  ha: [
+    ['temp', '温度实体（sensor）'],
+    ['humidity', '湿度实体（sensor）'],
+    ['air', '第三项：空气质量 sensor 或 weather'],
+    ['climate', '空调/温控（climate）'],
+    ['lights', '灯（light，逗号分隔）'],
+    ['switches', '开关/插座（switch，逗号分隔）'],
+    ['doors', '门窗（binary_sensor，逗号分隔）'],
+    ['lock', '门锁（lock）'],
+    ['power', '功率（sensor，W）'],
+    ['energy', '今日用电（sensor，kWh）'],
+    ['media', '媒体播放器（media_player）'],
+    ['chips', '概览 chip（climate,lights,switches,media,doors,lock）'],
+  ],
 };
 
 export const tiles = new Map();

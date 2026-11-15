@@ -783,6 +783,86 @@ export const WEATHER_TEXT = (code) => {
   return '多云';
 };
 
+
+// ---------------- Home Assistant ----------------
+// 概览组件只做“看”：温度/湿度/第三项大数字 + 4 个状态 chip + 底部功率。
+// token 只存在 host 的 config.json，这里只传 entity_id。
+const HA_ROLES = ['temp', 'humidity', 'air', 'climate', 'lights', 'switches', 'doors', 'lock', 'power', 'energy', 'media'];
+const HA_CLIMATE_LABEL = { off: '关', cool: '制冷', heat: '制热', dry: '除湿', fan_only: '送风', auto: '自动' };
+const HA_MEDIA_LABEL = { playing: '播放中', paused: '暂停', idle: '待机', off: '关', on: '开', buffering: '缓冲' };
+const HA_LOCK_LABEL = { locked: '已锁', unlocked: '未锁', locking: '上锁中', unlocking: '开锁中', jammed: '卡住' };
+const HA_WEATHER_LABEL = { clear: '晴', sunny: '晴', partlycloudy: '多云', cloudy: '阴', fog: '雾', hail: '冰雹',
+  lightning: '雷雨', rainy: '雨', pouring: '暴雨', snowy: '雪', windy: '大风', exceptional: '异常' };
+
+function haEntityIds(cfg) {
+  const out = [];
+  for (const k of HA_ROLES) {
+    for (const part of String((cfg && cfg[k]) || '').split(',')) {
+      const id = part.trim();
+      if (id && !out.includes(id)) out.push(id);
+    }
+  }
+  return out;
+}
+
+function haText(it) {
+  if (!it) return '—';
+  const s = String(it.state ?? '');
+  if (!s || s === 'unknown' || s === 'unavailable') return '—';
+  const dom = it.domain;
+  if (dom === 'climate') return HA_CLIMATE_LABEL[s] || s;
+  if (dom === 'media_player') return HA_MEDIA_LABEL[s] || s;
+  if (dom === 'lock') return HA_LOCK_LABEL[s] || s;
+  if (dom === 'weather') return HA_WEATHER_LABEL[s] || s;
+  if (dom === 'binary_sensor' || dom === 'input_boolean' || dom === 'light' || dom === 'switch')
+    return s === 'on' ? '开' : s === 'off' ? '关' : s;
+  return s;
+}
+
+function haMetric(ctx, x, y, w, h, label, value, unit, color, t) {
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = font(Math.max(11, Math.min(14, h * 0.13)), 600);
+  ctx.fillStyle = t.fg4;
+  tracked(ctx, label, x, y, 1.1);
+  const size = fitFont(ctx, String(value), w - 4, Math.min(h * 0.58, 64), 300, true);
+  ctx.font = font(size, 300, true);
+  ctx.fillStyle = color;
+  ctx.textBaseline = 'alphabetic';
+  const base = y + h * 0.78;
+  ctx.fillText(String(value), x, base);
+  if (unit) {
+    const vw = ctx.measureText(String(value)).width;
+    ctx.font = font(Math.max(13, size * 0.4), 400, true);
+    ctx.fillStyle = t.fg3;
+    ctx.fillText(unit, x + vw + 5, base);
+  }
+}
+
+function haChip(ctx, x, y, w, h, label, text, color, t) {
+  roundRect(ctx, x, y, w, h, 7);
+  ctx.fillStyle = 'rgba(255,255,255,0.035)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  const dot = Math.max(3.5, Math.min(5, h * 0.11));
+  ctx.beginPath();
+  ctx.arc(x + 12, y + h / 2, dot, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  const size = Math.max(12, Math.min(17, h * 0.33));
+  const tx = x + 12 + dot + 7;
+  ctx.font = font(size * 0.84, 600);
+  ctx.fillStyle = t.fg4;
+  ctx.fillText(label, tx, y + h / 2 - size * 0.52);
+  ctx.font = font(size, 500);
+  ctx.fillStyle = t.fg2;
+  ctx.fillText(ellipsis(ctx, text, w - (tx - x) - 8), tx, y + h / 2 + size * 0.52);
+}
+
 export const WIDGETS = {
   clock: {
     label: '时钟',
@@ -1763,6 +1843,130 @@ export const WIDGETS = {
       ctx.fillText(next.ongoing ? label : next.name, inner.x + inner.w / 2, inner.y + inner.h * 0.3);
       bigDays(ctx, inner.x + inner.w / 2, inner.y + inner.h * 0.72, inner.w * 0.9,
         Math.min(inner.w * 0.5, inner.h * 0.42), next.ongoing ? next.left : next.until, t, 'center', '');
+    },
+  },
+
+  ha: {
+    label: 'Home Assistant',
+    icon: '<path d="M2.5 7.5 8 3l5.5 4.5V13a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1z"/><path d="M6.5 14V9.5h3V14"/>',
+    min: [2, 1],
+    config: {
+      title: '家里',
+      temp: '', humidity: '', air: '',
+      climate: '', lights: '', switches: '', doors: '', lock: '',
+      power: '', energy: '', media: '',
+      chips: 'climate,lights,switches,media',
+    },
+    needs: { kind: 'ha', ttl: 2500, query: (cfg) => ({ entities: haEntityIds(cfg).join(',') }) },
+    draw(ctx, r, cfg, d, t) {
+      const items = (d && d.items) || {};
+      const online = !!(d && d.online) && !d.stale;
+      const pad = Math.max(12, r.w * 0.024);
+      const inner = card(ctx, r, t, {
+        title: cfg.title || '家里',
+        meta: !d ? 'HA …' : online ? 'HA 在线' : 'HA 离线',
+        metaColor: online ? t.fg4 : t.up,
+        pad,
+      });
+      if (!Object.keys(items).length) {
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = t.fg4;
+        ctx.font = font(Math.max(13, Math.min(20, inner.h * 0.12)), 400);
+        const msg = d && d.error ? 'HA：' + d.error : 'Home Assistant 未配置';
+        ctx.fillText(ellipsis(ctx, msg, inner.w * 0.92), inner.x + inner.w / 2, inner.y + inner.h / 2);
+        return;
+      }
+      const get = (id) => (id && items[id]) || null;
+      const idsOf = (v) => String(v || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+      const wide = inner.w > 460;
+      const metricKeys = wide ? ['temp', 'humidity', 'air'] : ['temp', 'humidity'];
+      const metricH = inner.h * (wide ? 0.5 : 0.54);
+      const colW = inner.w / metricKeys.length;
+      const labels = { temp: '室内温度', humidity: '室内湿度', air: '空气质量' };
+      metricKeys.forEach((key, i) => {
+        const x = inner.x + i * colW;
+        const it = get(cfg[key]);
+        let value = '—', unit = '', label = labels[key];
+        if (it) {
+          if (it.domain === 'weather') {
+            const a = it.attributes || {};
+            value = a.temperature != null ? String(a.temperature) : '—';
+            unit = '°C';
+            label = '室外 · ' + haText(it);
+          } else {
+            value = haText(it);
+            unit = it.unit || '';
+          }
+        }
+        haMetric(ctx, x, inner.y + 2, colW - 14, metricH, label, value, unit,
+          it && it.state !== 'unavailable' && it.state !== 'unknown' ? t.fg : t.fg4, t);
+        if (i) {
+          ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(x - 7.5, inner.y + metricH * 0.12);
+          ctx.lineTo(x - 7.5, inner.y + metricH * 0.9);
+          ctx.stroke();
+        }
+      });
+
+      const wanted = String(cfg.chips || 'climate,lights,switches,media').split(',').map((s) => s.trim()).filter(Boolean);
+      const chips = [];
+      for (const role of wanted) {
+        if (role === 'climate') {
+          const it = get(cfg.climate);
+          if (!it) continue;
+          const target = it.attributes && it.attributes.temperature != null ? ' · ' + it.attributes.temperature + '°' : '';
+          chips.push({ label: '空调', text: haText(it) + target, color: it.state === 'off' ? t.fg4 : t.accent });
+        } else if (role === 'lights' || role === 'switches') {
+          const list = idsOf(cfg[role]).map(get).filter(Boolean);
+          if (!list.length) continue;
+          const on = list.filter((it) => it.state === 'on').length;
+          const text = list.length === 1 ? haText(list[0])
+            : on === 0 ? '全关' : on === list.length ? '全开' : on + '/' + list.length + ' 开';
+          chips.push({ label: role === 'lights' ? '灯' : '电器', text, color: on ? t.accent : t.fg4 });
+        } else if (role === 'doors') {
+          const list = idsOf(cfg.doors).map(get).filter(Boolean);
+          if (!list.length) continue;
+          const open = list.filter((it) => it.state === 'on').length;
+          chips.push({ label: '门窗', text: open ? open + ' 开' : '全关', color: open ? t.up : t.down });
+        } else if (role === 'lock') {
+          const it = get(cfg.lock);
+          if (!it) continue;
+          const bad = it.state !== 'locked';
+          chips.push({ label: '门锁', text: haText(it), color: bad ? t.up : t.down });
+        } else if (role === 'media') {
+          const it = get(cfg.media);
+          if (!it) continue;
+          const title = it.attributes && it.attributes.media_title;
+          const text = it.state === 'playing' && title ? title : haText(it);
+          chips.push({ label: '音箱', text, color: it.state === 'playing' ? t.accent : t.fg4 });
+        }
+      }
+      const chipY = inner.y + metricH + 8;
+      const chipH = Math.max(36, Math.min(54, inner.h - metricH - 34));
+      if (inner.h >= 170 && chips.length) {
+        const gap = 8;
+        const chipW = (inner.w - gap * (chips.length - 1)) / chips.length;
+        chips.forEach((c, i) => haChip(ctx, inner.x + i * (chipW + gap), chipY, chipW, chipH, c.label, c.text, c.color, t));
+      }
+
+      const power = get(cfg.power), energy = get(cfg.energy);
+      const foot = [];
+      if (power) foot.push('⚡ 功率 ' + haText(power) + (power.unit ? ' ' + power.unit : ''));
+      if (energy) foot.push('今日 ' + haText(energy) + (energy.unit ? ' ' + energy.unit : ''));
+      const age = d && d.fetchedAt ? Math.max(0, Math.round((Date.now() - d.fetchedAt) / 1000)) : null;
+      const footY = inner.y + inner.h;
+      ctx.textBaseline = 'bottom';
+      ctx.textAlign = 'left';
+      ctx.font = font(Math.max(11, Math.min(14, inner.h * 0.06)), 400, true);
+      ctx.fillStyle = t.fg3;
+      ctx.fillText(ellipsis(ctx, foot.join('   ') || 'Home Assistant', inner.w * 0.7), inner.x, footY);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = online ? t.fg4 : t.up;
+      ctx.fillText(online ? (age != null ? '更新 ' + age + 's 前' : 'HA 在线') : 'HA 离线', inner.x + inner.w, footY);
     },
   },
 };
