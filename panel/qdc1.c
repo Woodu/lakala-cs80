@@ -474,6 +474,22 @@ static void sleep_ms(int ms) {
 #endif
 }
 
+/* 高速度端点 wMaxPacketSize=512。一次 URB 的长度如果正好是 512 的整数倍，
+ * HCD 会用零长度包(ZLP)标记传输结束；这台固件的 QDC1/CDC 接收路径对 ZLP
+ * 处理有 bug：它会把整条命令当成没收完，3 s 后回 status=8，屏上就闪一下
+ * 「等待连接」。实测 16 tile 的 patch 压出 3552 B + 32 B 头 = 3584 = 7×512
+ * 时必现。QDC1 本身是字节流，把最后一字节拆成单独一次写即可绕开。
+ * 整帧裸块的 32+512000 不是 512 整数倍，不受影响。 */
+static int raw_write_all(link_t *l, const void *buf, uint32_t len) {
+  if (len > 1 && (len % 512) == 0) {
+    tlog("cs80: split write %u B (512-multiple, avoid ZLP)\n", len);
+    int r = raw_write(l, buf, len - 1);
+    if (r) return r;
+    return raw_write(l, (const uint8_t *)buf + len - 1, 1);
+  }
+  return raw_write(l, buf, len);
+}
+
 static int send_cmd(link_t *l, uint8_t kind, uint16_t flags, uint32_t offset, uint32_t raw, const void *payload,
                     uint32_t len) {
   uint8_t *h = l->tx;
@@ -491,10 +507,11 @@ static int send_cmd(link_t *l, uint8_t kind, uint16_t flags, uint32_t offset, ui
   wr32(h + 24, xxh32(payload ? payload : "", len));
   wr32(h + 28, xxh32(h, 28));
   if (len) memcpy(h + 32, payload, len);
-  return raw_write(l, h, 32 + len);
+  return raw_write_all(l, h, 32 + len);
 }
 
 static uint32_t reply_body[6];
+static uint32_t patch_n;
 
 static void link_lost(const char *reason) {
   /* 带上固件回的状态码：0=OK（说明只是我们没等到）1..8 见 docs/protocol.md，
@@ -568,10 +585,12 @@ static void rgb_to_bgr565(const uint8_t *rgb, uint16_t *out) {
  * 改成按块压缩：每块 raw=512000（= QD_BLOCK_BYTES 上限）、codec=LZ4，固件逐块解到
  * framebuffer 对应偏移，既不会超限，单包也更小、更好重试。
  */
-/* 推一帧；raw_mode=1 时不压缩（flags=0 裸块），用来绕开固件 LZ4 解码的坑。
+/* 推一帧；raw_mode=1 时不压缩（flags=0 裸块），作为接收异常的兜底。
  * 返回 0=成功 / 1=设备没 ACK（可重试）/ -1=写失败（链路已死） */
-/* 固件 LZ4 解码对某些块会直接 TIMEOUT（同一画面必现）。攒住这些块的原始哈希，
- * 下次遇到同一块就直接发裸块，省掉两次失败重试。 */
+/* 整帧 LZ4 块以前偶发 status=8（同一画面必现），2026-11 定位到不是解码器：
+ * `32 + clen` 正好是 512 的整数倍时，HCD 补的 ZLP 会被固件接收路径漏掉。
+ * send_cmd 的 raw_write_all() 已把这种长度拆成 len-1 + 1；这里保留坏块哈希 /
+ * 裸块兜底，防其它接收异常。 */
 static uint32_t bad_blocks[8];
 static int bad_count;
 static double lz4_bad_until;  /* 最近踩过 LZ4 的坑：这段时间整帧直接发裸块 */
@@ -638,11 +657,11 @@ static int push_full_once(link_t *l, int raw_mode, uint32_t *wire, uint32_t *ms)
 }
 
 /* 整帧：先 LZ4；设备没 ACK 就原地重试（不重启 sidecar），最后一遍改发不压缩的裸块。
- * 固件 LZ4 解码遇到某些数据会直接 TIMEOUT（status=8，同一画面 100% 复现），
- * 裸块能绕过去；只有连裸块都不行才真正判定链路丢失。 */
+ * 裸块长度 512032 不是 512 整数倍，以前是绕过 ZLP 接收 bug 的手段；现在 send_cmd
+ * 已统一拆包，裸块只作为最后兜底。只有连裸块都不行才真正判定链路丢失。 */
 static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
-  /* 尝试顺序：LZ4（快）→ 裸块（一定能过，2 MB，~200 ms）→ 再 LZ4（万一裸块反而过不去）。
-   * 固件对这块不 ACK 时，它自己的接收超时是 3 s，所以「第一次踩坑」大约 3 s，之后走裸块就快了。
+  /* 尝试顺序：LZ4（快）→ 裸块（2 MB，~200 ms）→ 再 LZ4（万一裸块反而过不去）。
+   * 接收超时时固件 3 s 才回 status=8；裸块 512032 不是 512 整数倍，能绕过 ZLP 坑。
    * USB 全速（12 Mbps）下 2 MB 裸块 ≈1.7 s，而 LZ4 踩坑要 3 s 超时 + 再发 1.7 s；
    * host 检测到 speed<480 会设 CS80_RAW_FULL=1，直接走裸块。 */
   int skip_lz4 = now_ms() < lz4_bad_until || getenv("CS80_RAW_FULL") != NULL;
@@ -706,8 +725,8 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   double t0 = now_ms();
   int clen = LZ4_compress_default((const char *)raw, comp, (int)raw_len, cap);
   if (clen <= 0) return -5;
-  /* 设备偶尔会「收完命令但 3 s 才回 status=8（接收超时）」——固件那一刻在忙绘制。
-   * 对同一个 patch 原地重试（base 哈希没变，设备也没应用），比立刻让前端推 2 MB 整帧便宜得多。 */
+  /* status=8 是设备接收超时。以前偶发的原因是一次写正好 512 整数倍（ZLP 接收 bug），
+   * send_cmd 已拆包；这里保留一次原地重试兜底（base 哈希没变，设备也没应用）。 */
   int rc = -7, attempt = 0;
   for (; attempt < 2; attempt++) {  /* 1 次重试；再失败就交给整帧复位 */
     if (attempt) sleep_ms(250);
@@ -726,7 +745,8 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   *wire = (uint32_t)clen + 32;
   *ms = (uint32_t)(now_ms() - t0);
   if (*ms > 500)  /* 设备偶尔 2~3 s 才回 ACK：留证据（4=base 哈希不对，8=接收超时） */
-    tlog("cs80: slow patch ack %ums status=%u tiles=%u\n", *ms, reply_body[0], count);
+    tlog("cs80: slow patch ack %ums status=%u tiles=%u clen=%d rx=%u dec=%u draw=%u heap=%u\n", *ms,
+         reply_body[0], count, clen, reply_body[1], reply_body[2], reply_body[3], reply_body[4]);
   if (rc == 0) {
     if (reply_body[5] && reply_body[5] != target) {
       /* 设备上的 framebuffer 和设备自己算的哈希对不上：影子已不可信，整帧重来 */
@@ -950,8 +970,8 @@ int main(int argc, char **argv) {
       if (read_exact(tiles, (size_t)count * TILE_MSG)) break;
       uint32_t wire = 0, ms = 0;
       int r = push_patch(&l, tiles, count, &wire, &ms);
-      json("{\"event\":\"patch\",\"ok\":%d,\"code\":%d,\"status\":%u,\"tiles\":%u,\"wire\":%u,\"ms\":%u}", r == 0, r,
-           reply_body[0], count, wire, ms);
+      json("{\"event\":\"patch\",\"n\":%u,\"ok\":%d,\"code\":%d,\"status\":%u,\"tiles\":%u,\"wire\":%u,\"ms\":%u,\"rx\":%u,\"dec\":%u,\"draw\":%u,\"heap\":%u}", ++patch_n, r == 0, r,
+           reply_body[0], count, wire, ms, reply_body[1], reply_body[2], reply_body[3], reply_body[4]);
       if (r == -1) json("{\"event\":\"hint\",\"msg\":\"need full frame first\"}");
       /* 限速：给别人家的固件留出绘制时间。正常情况下浏览器 5 Hz（200 ms 一条）
        * 碰不到这个下限；但设备卡顿积压时，这里能防止 sidecar 一口气把几十条 patch

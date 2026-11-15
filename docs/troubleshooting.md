@@ -22,6 +22,31 @@
 
 `/api/status` 的 `session` 每次 sidecar 重连都会 +1；前端看到 `session` 变化会**整帧重推**。
 
+## 屏每隔几分钟/十几分钟闪回「等待连接」，几秒后又自己恢复
+
+先分清两种「断开」：
+
+| 证据 | 含义 | 处理 |
+|---|---|---|
+| `dmesg -T` 有 `USB disconnect` / `new high-speed USB device`，`/api/status` 的 `session` 也涨 | **真 USB 掉线**（重新枚举） | 查 Type-C 数据线 / DC 12V / 别挂 HUB（按上面 `device` 表） |
+| `session` 不涨，`sidecar.log` 出现 `slow patch ack ... status=8 ... rx≈3000000 dec=0 draw=0` | 固件 3 s 没把命令收全 → 5 s 后画等待页 → 重试后恢复 | 本节的 512 字节 ZLP 坑 |
+
+2026-11 Ubuntu 实测：`clen=3552` 的 patch + 32 B QDC1 头 = **3584 = 7×512**，正好是
+USB 高速度 OUT 端点 `wMaxPacketSize=512` 的整数倍。HCD 会补一个**零长度包（ZLP）**结束
+这次 bulk 传输；固件的 QDC1/CDC 接收路径不认 ZLP，于是整条命令一直等到 3 s 接收超时，
+回 `status=8`。ACK 里的 `rx≈3.0 s`、`dec=0`、`draw=0` 就是证据（设备根本没开始解码/绘制）。
+这 3 s 里没有新命令，超过固件 `QD_HOST_TIMEOUT_MS=5000` 就画等待页；重试或整帧恢复后
+看起来就是「自动重连」。整帧 LZ4 的 `clen=16864`（32+16864=33×512）是**同一个坑**，
+不是 LZ4 解码器。
+
+**已修**（`panel/qdc1.c` 的 `raw_write_all()`）：一次写的总长度是 512 整数倍时，拆成
+`len-1` + `1` 两次写。QDC1 是字节流，设备侧无感；日志会留一行
+`cs80: split write 6656 B (512-multiple, avoid ZLP)`。
+验证：拆包后同尺寸 patch 3 ms 内 `status=0`，`rx` 回到几十 µs，`session` 不涨。
+
+> 如果 `dmesg` 里持续出现 `USB disconnect` / `device number` 变化，那是真的 USB 掉线，
+> 按上面 `device` 不是 `up` 的表查线/供电/HUB；本节只解决「USB 没断但屏回到等待页」。
+
 ## 画面一卡一卡 / 几秒到几分钟不更新（Linux 无桌面）
 
 按这个顺序看，三条都踩过：
@@ -201,8 +226,15 @@ py\python.exe qdisplay_app.py qdisplay_native_static.bin --auto
 
 ## 整帧推不上去：`no-ack-data status=8`，而且**同一画面必现**
 
-2026-11 又抓到一类（和上面「单块 >512 KB」不是同一个）：**固件 LZ4 解码遇到某些数据会直接回
-`status=8 TIMEOUT`**，跟画面大小无关。特征：
+> **2026-11 更新：根因已定位，不是 LZ4 解码器。** 日志里的 `clen=16864` + 32 B 头 =
+> `16896 = 33×512`，正好是 USB 端点 `wMaxPacketSize` 的整数倍 → HCD 补的 ZLP 被固件
+> 接收路径漏掉，3 s 后回 `status=8`。`qdc1.c` 的 `raw_write_all()` 已把这种长度拆成
+> `len-1` + `1` 两次写，**新 sidecar 不会再因为这个原因失败**。下面的裸块兜底
+> 仍保留，防其它接收异常。
+
+2026-11 又抓到一类（和上面「单块 >512 KB」不是同一个）。当时的判断是**固件 LZ4 解码遇到某些
+数据会直接回 `status=8 TIMEOUT`**，跟画面大小无关；后来（见上面的更新）确认是 512 整数倍 ZLP。
+当时的特征：
 
 - 同一个页面/组件，推帧必挂；换个页面（哪怕内容更复杂）就正常 → 看起来像"某个组件把设备搞坏了"
 - 日志固定同一块失败：`cs80: data fail block=0 raw=512000 clen=16864 status=8 mode=lz4`

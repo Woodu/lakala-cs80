@@ -87,4 +87,7 @@
 - `payload_hash` 空 payload = `0x02cc5d05`，不是 0
 - `COMMIT` 必须 `flags=1` 才允许后续 `PATCH`
 - 设备 `PATCH` 的 tile 固定 32×16，布局/脏矩形都要对齐它
+- **一次写的长度（32 B 头 + payload）正好是 512 的整数倍 → HCD 补 ZLP → 固件接收超时 `status=8`**。
+  看起来像“LZ4 解码坏 / 设备忙 / 自动重连”，实际 ACK 里 `rx≈3 s`、`dec=0`、`draw=0`。
+  拆成 `len-1` + `1` 两次写即可（`qdc1.c` 的 `raw_write_all()`），QDC1 是字节流，设备无感。
 - Tauri 打包资源是**显式列举**的：新增 `web/**` 文件忘了加，打包版就会白屏
