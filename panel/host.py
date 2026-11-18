@@ -1013,6 +1013,113 @@ def tts_mp3(text):
             return f.read()
 
 
+# ---------------- 蜂窝（4G）状态 ----------------
+# QDisplay 固件不碰基带，AT 口（复合设备 MI_02，驱动名「Quectel USB AT Port」）仍然可用，
+# SIM/信号/注册状态直接问模组。与显示数据口（MI_20/COM+sidecar）互不干扰。
+try:
+    import serial as _serial
+except Exception:
+    _serial = None
+
+_AT_LOCK = threading.Lock()
+
+_CEREG_STAT = {0: "未注册", 1: "已注册", 2: "搜索中", 3: "注册被拒", 4: "未知", 5: "漫游"}
+
+
+def _windows_at_com():
+    """Windows：AT 口是复合设备的 MI_02 接口。与 _windows_qdc1_com() 同样只认
+    当前在场的口（拔插会留旧实例）；`CS80_AT_COM` 可手工指定。"""
+    env = os.environ.get("CS80_AT_COM", "").strip()
+    if env:
+        return env
+    try:
+        import winreg
+    except Exception:
+        return ""
+    active = _active_coms()
+    base = r"SYSTEM\CurrentControlSet\Enum\USB\VID_2C7C&PID_0901&MI_02"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as k:
+            for i in range(16):
+                try:
+                    inst = winreg.EnumKey(k, i)
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(k, inst + r"\Device Parameters") as dp:
+                        port = str(winreg.QueryValueEx(dp, "PortName")[0] or "")
+                except OSError:
+                    continue
+                if port and (not active or port.upper() in active):
+                    return port
+    except OSError:
+        pass
+    return ""
+
+
+def _at_ask(ser, cmd, timeout=1.2):
+    """发一条 AT 命令并等终止行（OK/ERROR）；卡住就按超时返回已有内容。"""
+    ser.reset_input_buffer()
+    ser.write((cmd + "\r\n").encode())
+    buf = b""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        chunk = ser.read(128)
+        if chunk:
+            buf += chunk
+            text = buf.decode("ascii", errors="replace")
+            if "OK" in text or "ERROR" in text:
+                break
+    return buf.decode("ascii", errors="replace")
+
+
+def cellular_status():
+    """读模组蜂窝状态（SIM/信号/注册/运营商）。只做只读查询，
+    任何失败都返回 available=false，绝不影响其它组件。"""
+    if _serial is None:
+        return {"available": False, "error": "需要 pyserial：pip install pyserial"}
+    if os.name != "nt":
+        return {"available": False, "error": "蜂窝查询目前只在 Windows（注册表找 MI_02 AT 口）"}
+    port = _windows_at_com()
+    if not port:
+        return {"available": False, "error": "没找到 AT 口（MI_02）"}
+    out = {"available": True, "port": port}
+    with _AT_LOCK:
+        try:
+            ser = _serial.Serial(port, 115200, timeout=0.15)
+        except Exception as exc:
+            return {"available": False, "port": port, "error": f"打开 {port} 失败：{exc}"}
+        try:
+            ser.setDTR(False)
+            ser.setRTS(False)
+            m = re.search(r"\+CPIN:\s*([A-Z ]+)", _at_ask(ser, "AT+CPIN?"))
+            if m:
+                out["sim"] = m.group(1).strip().lower()
+            m = re.search(r"\+CSQ:\s*(\d+)", _at_ask(ser, "AT+CSQ"))
+            if m:
+                rssi = int(m.group(1))
+                out["rssi"] = rssi
+                if rssi < 99:
+                    out["dbm"] = -113 + 2 * rssi
+                    out["bars"] = min(1.0, rssi / 31.0)
+            m = re.search(r"\+CEREG:\s*\d+,(\d+)", _at_ask(ser, "AT+CEREG?"))
+            if m:
+                stat = int(m.group(1))
+                out["reg"] = _CEREG_STAT.get(stat, "未知")
+                out["reg_code"] = stat
+            m = re.search(r'\+COPS:\s*\d+,\d+,"([^"]*)"', _at_ask(ser, "AT+COPS?", timeout=3.0))
+            if m and m.group(1):
+                out["operator"] = m.group(1)
+        except Exception as exc:
+            return {"available": False, "port": port, "error": f"AT 查询失败：{exc}"}
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+    return out
+
+
 # ---------------- 数据源 ----------------
 class Cache:
     def __init__(self):
@@ -2627,6 +2734,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/data/system":
             # 0.9s 缓存：多个组件共用一次采样，网速差分才有固定 dt
             return self._send(200, CACHE.get("sys", 0.9, system_metrics))
+        if path == "/api/data/cellular":
+            # 30s 缓存：AT 查询每条 ~0.3s，组件也不需要更快的刷新
+            return self._send(200, CACHE.get("cellular", 30, cellular_status))
         if path == "/api/data/ha":
             ids = [x.strip() for x in (qs.get("entities") or [""])[0].split(",") if x.strip()]
             if not ids:

@@ -1089,6 +1089,53 @@ export const WIDGETS = {
     },
   },
 
+  cellular: {
+    label: '4G',
+    icon: '<rect x="2" y="11" width="2.4" height="3" rx="0.6"/><rect x="5.6" y="8.5" width="2.4" height="5.5" rx="0.6"/><rect x="9.2" y="6" width="2.4" height="8" rx="0.6"/><rect x="12.8" y="3.5" width="2.4" height="10.5" rx="0.6"/>',
+    min: [1, 1],
+    needs: { kind: 'cellular', ttl: 30000 },
+    draw(ctx, r, cfg, d, t) {
+      const pad = Math.max(10, r.w * 0.06);
+      const inner = card(ctx, r, t, {
+        title: cfg.title || '4G',
+        meta: d && d.available && d.operator ? d.operator : (d && d.port) || '',
+        pad,
+      });
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'left';
+      if (!d || !d.available) {
+        ctx.fillStyle = t.fg4;
+        ctx.font = font(Math.max(12, inner.h * 0.14), 400);
+        ctx.fillText(d && d.error ? ellipsis(ctx, d.error, inner.w) : '不可用', inner.x, inner.y);
+        return;
+      }
+      // 上半：5 格信号条（注册上才点亮）+ dBm
+      const n = 5;
+      const filled = Math.round((d.bars || 0) * n);
+      const bw = Math.max(6, inner.w * 0.09);
+      const gap = bw * 0.5;
+      const maxH = inner.h * 0.4;
+      const lit = d.reg_code === 1 || d.reg_code === 5;
+      for (let i = 0; i < n; i++) {
+        const h = (maxH * (i + 1)) / n;
+        const x = inner.x + i * (bw + gap);
+        const y = inner.y + inner.h * 0.36 + maxH - h;
+        ctx.fillStyle = i < filled && lit ? t.accent : t.line;
+        ctx.fillRect(x, y, bw, h);
+      }
+      ctx.textAlign = 'right';
+      ctx.fillStyle = t.fg2;
+      ctx.font = font(Math.max(13, inner.h * 0.2), 400, true);
+      ctx.fillText(d.dbm != null ? `${d.dbm} dBm` : `CSQ ${d.rssi}`, inner.x + inner.w, inner.y + inner.h * 0.4);
+      // 下半：SIM / 注册状态
+      ctx.textAlign = 'left';
+      ctx.fillStyle = t.fg3;
+      ctx.font = font(Math.max(11, inner.h * 0.13), 400);
+      const simTxt = d.sim === 'ready' ? 'SIM 正常' : `SIM ${d.sim || '?'}`;
+      ctx.fillText(`${simTxt} · ${d.reg || '未注册'}`, inner.x, inner.y + inner.h * 0.74);
+    },
+  },
+
   weather: {
     label: '天气',
     icon: '<path d="M5 11.5a2.5 2.5 0 0 1 .3-5 3.5 3.5 0 0 1 6.6 1A2 2 0 0 1 12 11.5"/><circle cx="5.5" cy="4.5" r="1.6"/>',
